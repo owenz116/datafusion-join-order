@@ -82,6 +82,7 @@ pub use optimizer::{
 
 pub(crate) mod join_key_set;
 mod plan_signature;
+mod join_order;
 
 #[cfg(test)]
 #[ctor::ctor]
