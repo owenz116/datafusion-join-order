@@ -6,6 +6,10 @@ use datafusion_common::tree_node::{TreeNode, TreeNodeRecursion};
 use datafusion_expr::logical_plan::{Join, LogicalPlan, SubqueryAlias, TableScan};
 use datafusion_expr::{Expr, JoinConstraint, JoinType};
 
+
+type BitSet = u64;
+
+
 /// A base relation participating in a join island.
 ///
 /// For Commit 1 we treat *any* leaf logical plan (typically
@@ -279,6 +283,315 @@ fn relation_ref_and_name(plan: &LogicalPlan) -> Option<(TableReference, String)>
     }
 }
 
+/// DP entry for a subset of relations (bitset) in the DPhyp-style table.
+#[derive(Debug, Clone)]
+pub struct DPhypPlanEntry {
+    /// Bitset encoding the subset of relations this entry refers to.
+    pub subset: BitSet,
+    /// If this subset was obtained by joining `left` and `right`,
+    /// these fields store the two child subsets. `None` for base relations.
+    pub left: Option<BitSet>,
+    pub right: Option<BitSet>,
+    /// Accumulated cost of the best plan for this subset.
+    pub cost: f64,
+    /// Estimated cardinality for this subset (placeholder model for now).
+    pub cardinality: f64,
+}
+
+/// Result of running the DPhyp-style DP on a `JoinGraph`.
+#[derive(Debug, Clone)]
+pub struct DPhypResult {
+    /// Best plan for each connected subset (keyed by subset bitmask).
+    pub plans: HashMap<BitSet, DPhypPlanEntry>,
+    /// Bitmask of the full connected set of relations we optimized for.
+    pub full_subset: BitSet,
+}
+
+/// Run a DPhyp-style DP over the given join graph.
+///
+/// - `base_cardinalities`: optional per-relation base cardinalities,
+///   indexed by `JoinRelation.id` (0..n-1). If `None` or too short,
+///   we fall back to 1.0 for that relation.
+///
+/// Placeholder cost model:
+///   * base relation i: card_i = base_card_i, cost_i = card_i
+///   * join of subsets L and R:
+///       result_card = card(L) * card(R)
+///       result_cost = cost(L) + cost(R) + result_card
+///
+/// This mirrors the classic System R–style "sum of intermediate costs"
+/// idea and is easy to swap out later with a DataFusion stats-based model. 
+pub fn dphyp_optimize_join_graph<M: DPhypCostModel>(
+    graph: &JoinGraph,
+    model: &M,
+) -> Option<DPhypResult> {
+    let n = graph.relations.len();
+    if n == 0 {
+        return None;
+    }
+    if n > 63 {
+        return None;
+    }
+
+    let neighbors = build_neighbor_masks(graph);
+    let full_mask: BitSet = if n == 64 {
+        u64::MAX
+    } else {
+        (1u64 << n) - 1
+    };
+
+    let mut connected_subsets: Vec<BitSet> = Vec::new();
+    for mask in 1..=full_mask {
+        if is_connected_mask(mask, &neighbors) {
+            connected_subsets.push(mask);
+        }
+    }
+    connected_subsets.sort_by_key(|m| bit_count(*m));
+
+    let mut plans: HashMap<BitSet, DPhypPlanEntry> = HashMap::new();
+
+    // ---- base relations (singletons) ----
+    for rel in 0..n {
+        let mask = 1u64 << rel;
+        if !is_connected_mask(mask, &neighbors) {
+            continue;
+        }
+
+        let (base_cost, base_card) = model.base_cost_cardinality(rel, graph);
+        plans.insert(
+            mask,
+            DPhypPlanEntry {
+                subset: mask,
+                left: None,
+                right: None,
+                cost: base_cost,
+                cardinality: base_card,
+            },
+        );
+    }
+
+    // ---- larger connected subsets ----
+    for &subset in &connected_subsets {
+        if bit_count(subset) <= 1 {
+            continue;
+        }
+
+        let mut best: Option<DPhypPlanEntry> = None;
+
+        let mut sub = subset & (subset - 1);
+        while sub > 0 {
+            let left_mask = sub;
+            let right_mask = subset ^ left_mask;
+            if right_mask == 0 {
+                sub = (sub - 1) & subset;
+                continue;
+            }
+
+            let left_plan = match plans.get(&left_mask) {
+                Some(p) => p,
+                None => {
+                    sub = (sub - 1) & subset;
+                    continue;
+                }
+            };
+            let right_plan = match plans.get(&right_mask) {
+                Some(p) => p,
+                None => {
+                    sub = (sub - 1) & subset;
+                    continue;
+                }
+            };
+
+            if !has_cross_edge(left_mask, right_mask, &neighbors) {
+                sub = (sub - 1) & subset;
+                continue;
+            }
+
+            // delegate completely to cost model
+            let (join_cost, result_card) =
+                model.join_cost_cardinality(left_plan, right_plan, graph);
+
+            let result_cost = left_plan.cost + right_plan.cost + join_cost;
+
+            match &mut best {
+                None => {
+                    best = Some(DPhypPlanEntry {
+                        subset,
+                        left: Some(left_mask),
+                        right: Some(right_mask),
+                        cost: result_cost,
+                        cardinality: result_card,
+                    });
+                }
+                Some(b) => {
+                    if result_cost < b.cost {
+                        *b = DPhypPlanEntry {
+                            subset,
+                            left: Some(left_mask),
+                            right: Some(right_mask),
+                            cost: result_cost,
+                            cardinality: result_card,
+                        };
+                    }
+                }
+            }
+
+            sub = (sub - 1) & subset;
+        }
+
+        if let Some(entry) = best {
+            plans.insert(subset, entry);
+        }
+    }
+
+    if !plans.contains_key(&full_mask) {
+        return None;
+    }
+
+    Some(DPhypResult {
+        plans,
+        full_subset: full_mask,
+    })
+}
+
+
+/// Build bitset neighbor masks for each relation in the join graph.
+///
+/// neighbors[i] has bits set for all j such that there is an edge i <-> j.
+fn build_neighbor_masks(graph: &JoinGraph) -> Vec<BitSet> {
+    let n = graph.relations.len();
+    let mut neighbors = vec![0u64; n];
+    for e in &graph.edges {
+        if e.left < n && e.right < n {
+            neighbors[e.left] |= 1u64 << e.right;
+            neighbors[e.right] |= 1u64 << e.left;
+        }
+    }
+    neighbors
+}
+
+/// Count bits in a BitSet.
+fn bit_count(mask: BitSet) -> usize {
+    mask.count_ones() as usize
+}
+
+/// Check if `mask` induces a connected subgraph in the query graph
+/// represented by `neighbors`.
+fn is_connected_mask(mask: BitSet, neighbors: &[BitSet]) -> bool {
+    if mask == 0 {
+        return false;
+    }
+
+    // Start BFS from the lowest-numbered relation in `mask`.
+    let start = mask.trailing_zeros() as usize;
+    let mut visited: BitSet = 0;
+    let mut stack: Vec<usize> = Vec::new();
+
+    visited |= 1u64 << start;
+    stack.push(start);
+
+    while let Some(v) = stack.pop() {
+        let mut nbrs = neighbors[v] & mask;
+        while nbrs != 0 {
+            let idx = nbrs.trailing_zeros() as usize;
+            let bit = 1u64 << idx;
+            nbrs ^= bit;
+            if visited & bit == 0 {
+                visited |= bit;
+                stack.push(idx);
+            }
+        }
+    }
+
+    visited == mask
+}
+
+/// Check whether there is any edge crossing the cut (A, B).
+fn has_cross_edge(a: BitSet, b: BitSet, neighbors: &[BitSet]) -> bool {
+    let mut tmp = a;
+    while tmp != 0 {
+        let idx = tmp.trailing_zeros() as usize;
+        let bit = 1u64 << idx;
+        tmp ^= bit;
+        if neighbors[idx] & b != 0 {
+            return true;
+        }
+    }
+    false
+}
+
+
+/// Cost model for DPhyp-style DP over a `JoinGraph`.
+///
+/// The DP recurrence is:
+///   cost(S) = min over splits S = L ∪ R:
+///       cost(L) + cost(R) + join_cost(L,R)
+///
+/// `base_cost_cardinality` and `join_cost_cardinality` let you
+/// define both `cost` and `cardinality` in one place.
+pub trait DPhypCostModel {
+    /// Cost and cardinality of a base relation (singleton subset)
+    /// identified by its relation id in `graph.relations`.
+    fn base_cost_cardinality(
+        &self,
+        rel_id: usize,
+        graph: &JoinGraph,
+    ) -> (f64 /*cost*/, f64 /*cardinality*/);
+
+    /// Incremental join cost and resulting cardinality for joining
+    /// `left` and `right` subsets.
+    ///
+    /// Returned `(join_cost, result_cardinality)` is interpreted as:
+    ///
+    ///   cost(S) = cost(L) + cost(R) + join_cost
+    ///   card(S) = result_cardinality
+    fn join_cost_cardinality(
+        &self,
+        left: &DPhypPlanEntry,
+        right: &DPhypPlanEntry,
+        graph: &JoinGraph,
+    ) -> (f64 /*join_cost*/, f64 /*result_cardinality*/);
+}
+
+/// Simple placeholder cost model:
+///
+/// - base: cost = card = given base_cardinalities[i] or 1.0
+/// - join: result_card = left.card * right.card
+///         join_cost  = result_card
+///
+/// So:
+///   cost(S) = cost(L) + cost(R) + card(S)
+pub struct SimpleCardinalityCostModel<'a> {
+    pub base_cardinalities: Option<&'a [f64]>,
+}
+
+impl<'a> DPhypCostModel for SimpleCardinalityCostModel<'a> {
+    fn base_cost_cardinality(
+        &self,
+        rel_id: usize,
+        _graph: &JoinGraph,
+    ) -> (f64, f64) {
+        let card = self
+            .base_cardinalities
+            .and_then(|v| v.get(rel_id).copied())
+            .unwrap_or(1.0);
+        (card, card)
+    }
+
+    fn join_cost_cardinality(
+        &self,
+        left: &DPhypPlanEntry,
+        right: &DPhypPlanEntry,
+        _graph: &JoinGraph,
+    ) -> (f64, f64) {
+        let result_card = left.cardinality * right.cardinality;
+        let join_cost = result_card;
+        (join_cost, result_card)
+    }
+}
+
+
+
 
 
 #[cfg(test)]
@@ -362,4 +675,147 @@ mod tests {
         assert!(names.contains(&"a"));
         assert!(names.contains(&"b"));
     }
+
+    #[test]
+    fn dphyp_two_way_join_cost() {
+        // Graph: A -- B
+        let rel_a = JoinRelation {
+            id: 0,
+            name: "A".to_string(),
+            plan: dummy_scan("A"),
+            filters: vec![],
+        };
+        let rel_b = JoinRelation {
+            id: 1,
+            name: "B".to_string(),
+            plan: dummy_scan("B"),
+            filters: vec![],
+        };
+
+        let relations = vec![rel_a, rel_b];
+
+        let edges = vec![
+            // A <-> B
+            JoinEdge {
+                left: 0,
+                right: 1,
+                on: vec![],
+            },
+        ];
+
+        let graph = JoinGraph { relations, edges };
+
+        // base cardinalities: |A| = 1000, |B| = 10
+        let base = [1000.0_f64, 10.0_f64];
+
+        let model = SimpleCardinalityCostModel {
+            base_cardinalities: Some(&base),
+        };
+
+        let result =
+            dphyp_optimize_join_graph(&graph, &model).expect("expected a DP result");
+
+
+        // let result =
+        //     dphyp_optimize_join_graph(&graph, Some(&base)).expect("expected a DP result");
+
+        assert_eq!(result.full_subset, 0b11);
+
+        let p1 = result.plans.get(&0b01).expect("plan for {A}");
+        assert_eq!(p1.cardinality, 1000.0);
+        let p2 = result.plans.get(&0b10).expect("plan for {B}");
+        assert_eq!(p2.cardinality, 10.0);
+
+        let p12 = result.plans.get(&0b11).expect("plan for {A,B}");
+        assert_eq!(p12.cardinality, 1000.0 * 10.0);
+        assert_eq!(p12.cost, 1000.0 + 10.0 + 1000.0 * 10.0);
+        assert!(p12.left.is_some() && p12.right.is_some());
+    }
+
+    #[test]
+    fn dphyp_three_way_chain_prefers_middle_relation_first() {
+        // Graph: A -- B -- C
+        //
+        // Cardinalities:
+        //   |A| = 1000
+        //   |B| = 10
+        //   |C| = 1
+        //
+        // Under the placeholder cost model:
+        //
+        // Plan 1: (A ⋈ B) ⋈ C
+        //   AB: card = 1000 * 10 = 10_000
+        //       cost = 1000 + 10 + 10_000 = 11_010
+        //   ABC: card = 10_000 * 1 = 10_000
+        //        cost = 11_010 + 1 + 10_000 = 22_021
+        //
+        // Plan 2: (B ⋈ C) ⋈ A
+        //   BC: card = 10 * 1 = 10
+        //       cost = 10 + 1 + 10 = 21
+        //   ABC: card = 10 * 1000 = 10_000
+        //        cost = 21 + 1000 + 10_000 = 11_021
+        //
+        // So the optimal plan is (B ⋈ C) ⋈ A with cost 11_021.
+
+        let rel_a = JoinRelation {
+            id: 0,
+            name: "A".to_string(),
+            plan: dummy_scan("A"),
+            filters: vec![],
+        };
+        let rel_b = JoinRelation {
+            id: 1,
+            name: "B".to_string(),
+            plan: dummy_scan("B"),
+            filters: vec![],
+        };
+        let rel_c = JoinRelation {
+            id: 2,
+            name: "C".to_string(),
+            plan: dummy_scan("C"),
+            filters: vec![],
+        };
+
+        let relations = vec![rel_a, rel_b, rel_c];
+
+        let edges = vec![
+            // A <-> B
+            JoinEdge {
+                left: 0,
+                right: 1,
+                on: vec![],
+            },
+            // B <-> C
+            JoinEdge {
+                left: 1,
+                right: 2,
+                on: vec![],
+            },
+        ];
+
+        let graph = JoinGraph { relations, edges };
+
+        let base = [1000.0_f64, 10.0_f64, 1.0_f64];
+
+        // let result =
+        //     dphyp_optimize_join_graph(&graph, Some(&base)).expect("expected a DP result");
+        let model = SimpleCardinalityCostModel {
+            base_cardinalities: Some(&base),
+        };
+
+        let result =
+            dphyp_optimize_join_graph(&graph, &model).expect("expected a DP result");
+
+
+        assert_eq!(result.full_subset, 0b111);
+
+        let root = result
+            .plans
+            .get(&result.full_subset)
+            .expect("plan for full subset {A,B,C}");
+
+        assert!((root.cost - 11_021.0).abs() < 1e-6);
+        assert!(root.left.is_some() && root.right.is_some());
+    }
+
 }
