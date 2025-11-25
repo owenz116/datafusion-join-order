@@ -818,4 +818,324 @@ mod tests {
         assert!(root.left.is_some() && root.right.is_some());
     }
 
+    /// Compute the cost and cardinality of `plan` using the same
+    /// `DPhypCostModel` as the DP. Returns (cost, cardinality, subset_mask).
+    ///
+    /// `subset_mask` is a bitset over `graph.relations`, so we can
+    /// confirm it matches the full_DP_subset.
+    fn naive_cost_for_plan<M: DPhypCostModel>(
+        plan: &LogicalPlan,
+        graph: &JoinGraph,
+        model: &M,
+    ) -> (f64, f64, BitSet) {
+        match plan {
+            LogicalPlan::Join(j) => {
+                let (cost_l, card_l, mask_l) =
+                    naive_cost_for_plan(&j.left, graph, model);
+                let (cost_r, card_r, mask_r) =
+                    naive_cost_for_plan(&j.right, graph, model);
+
+                // create ephemeral entries so we can call join_cost_cardinality
+                let left_entry = DPhypPlanEntry {
+                    subset: mask_l,
+                    left: None,
+                    right: None,
+                    cost: cost_l,
+                    cardinality: card_l,
+                };
+                let right_entry = DPhypPlanEntry {
+                    subset: mask_r,
+                    left: None,
+                    right: None,
+                    cost: cost_r,
+                    cardinality: card_r,
+                };
+
+                let (join_cost, result_card) =
+                    model.join_cost_cardinality(&left_entry, &right_entry, graph);
+                let total_cost = cost_l + cost_r + join_cost;
+                (total_cost, result_card, mask_l | mask_r)
+            }
+            // we expect only Join + TableScan/SubqueryAlias in these tests
+            _ => {
+                let (tref, _) = relation_ref_and_name(plan)
+                    .expect("expected base relation in naive_cost_for_plan");
+
+                // find corresponding relation id in graph
+                let rel = graph
+                    .relations
+                    .iter()
+                    .find(|r| {
+                        if let Some((rel_tref, _)) = relation_ref_and_name(&r.plan) {
+                            rel_tref == tref
+                        } else {
+                            false
+                        }
+                    })
+                    .expect("relation not found in JoinGraph for naive cost");
+
+                let (base_cost, base_card) =
+                    model.base_cost_cardinality(rel.id, graph);
+                (base_cost, base_card, 1u64 << rel.id)
+            }
+        }
+    }
+
+    #[test]
+    fn extracted_three_way_join_is_not_worse_than_original_tree() {
+        // Build logical plan: ((A ⋈ B) ⋈ C)
+        let a_scan = dummy_scan("A");
+        let b_scan = dummy_scan("B");
+        let c_scan = dummy_scan("C");
+
+        // A ⋈ B on A.id = B.id
+        let ab_join = LogicalPlanBuilder::from(a_scan)
+            .join(
+                b_scan,
+                JoinType::Inner,
+                (
+                    vec![Column::new(Some(TableReference::from("A")), "id")],
+                    vec![Column::new(Some(TableReference::from("B")), "id")],
+                ),
+                None,
+            )
+            .unwrap()
+            .build()
+            .unwrap();
+
+        // (A ⋈ B) ⋈ C on B.id = C.id  (gives edges A-B and B-C)
+        let abc_join = LogicalPlanBuilder::from(ab_join)
+            .join(
+                c_scan,
+                JoinType::Inner,
+                (
+                    vec![Column::new(Some(TableReference::from("B")), "id")],
+                    vec![Column::new(Some(TableReference::from("C")), "id")],
+                ),
+                None,
+            )
+            .unwrap()
+            .build()
+            .unwrap();
+
+
+        // 1) Extract join graph from the plan (Commit 1)
+        let graph = extract_join_graph(&abc_join)
+            .expect("extract_join_graph should succeed")
+            .expect("expected a join graph for three-way join");
+
+        assert_eq!(graph.relations.len(), 3);
+        assert!(graph.edges.len() >= 2); // at least 2 join predicates
+
+        // 2) Build base cardinalities per extracted relation id
+        //
+        // We skew the cardinalities on purpose:
+        // |A| = 1000, |B| = 10, |C| = 1
+        let mut base = vec![1.0_f64; graph.relations.len()];
+        for rel in &graph.relations {
+            base[rel.id] = match rel.name.as_str() {
+                "A" | "a" => 1000.0,
+                "B" | "b" => 10.0,
+                "C" | "c" => 1.0,
+                other => panic!("unexpected relation name in test: {other}"),
+            };
+        }
+
+        let model = SimpleCardinalityCostModel {
+            base_cardinalities: Some(&base),
+        };
+
+        // 3) Run DPhyp-style DP (Commit 2)
+        let result = dphyp_optimize_join_graph(&graph, &model)
+            .expect("expected a DP result for three-way join");
+
+        // 4) Compute the cost of the *original* join tree using the same model
+        let (naive_cost, naive_card, naive_mask) =
+            naive_cost_for_plan(&abc_join, &graph, &model);
+
+        let root = result
+            .plans
+            .get(&result.full_subset)
+            .expect("plan for full subset {A,B,C}");
+
+        // The DP plan should cover the same set of relations
+        assert_eq!(naive_mask, result.full_subset);
+
+        // And the DP plan should be no more expensive than the original plan
+        assert!(
+            root.cost <= naive_cost + 1e-6,
+            "DP cost {} should be <= naive cost {} (card DP = {}, card naive = {})",
+            root.cost,
+            naive_cost,
+            root.cardinality,
+            naive_card
+        );
+    }
+
+    /// Collect all 2-element subsets (bitmasks) that appear as internal
+    /// nodes in the chosen DP plan for `subset`.
+    fn collect_pair_subsets(
+        result: &DPhypResult,
+        subset: BitSet,
+        out: &mut Vec<BitSet>,
+    ) {
+        let entry = match result.plans.get(&subset) {
+            Some(e) => e,
+            None => return,
+        };
+
+        if let (Some(l), Some(r)) = (entry.left, entry.right) {
+            if bit_count(l) == 2 {
+                out.push(l);
+            } else if bit_count(l) > 2 {
+                collect_pair_subsets(result, l, out);
+            }
+
+            if bit_count(r) == 2 {
+                out.push(r);
+            } else if bit_count(r) > 2 {
+                collect_pair_subsets(result, r, out);
+            }
+        }
+    }
+
+    #[test]
+    fn extracted_four_way_chain_uses_smallest_pair_in_optimal_plan() {
+        // Build logical plan: (((A ⋈ B) ⋈ C) ⋈ D)
+        let a_scan = dummy_scan("A");
+        let b_scan = dummy_scan("B");
+        let c_scan = dummy_scan("C");
+        let d_scan = dummy_scan("D");
+
+        // A ⋈ B on A.id = B.id
+        let ab = LogicalPlanBuilder::from(a_scan)
+            .join(
+                b_scan,
+                JoinType::Inner,
+                (
+                    vec![Column::new(Some(TableReference::from("A")), "id")],
+                    vec![Column::new(Some(TableReference::from("B")), "id")],
+                ),
+                None,
+            )
+            .unwrap()
+            .build()
+            .unwrap();
+
+        // (A ⋈ B) ⋈ C on B.id = C.id  (chain A-B-C)
+        let abc = LogicalPlanBuilder::from(ab)
+            .join(
+                c_scan,
+                JoinType::Inner,
+                (
+                    vec![Column::new(Some(TableReference::from("B")), "id")],
+                    vec![Column::new(Some(TableReference::from("C")), "id")],
+                ),
+                None,
+            )
+            .unwrap()
+            .build()
+            .unwrap();
+
+        // ((A ⋈ B) ⋈ C) ⋈ D on C.id = D.id  (chain B-C-D, so edges A-B, B-C, C-D)
+        let abcd = LogicalPlanBuilder::from(abc)
+            .join(
+                d_scan,
+                JoinType::Inner,
+                (
+                    vec![Column::new(Some(TableReference::from("C")), "id")],
+                    vec![Column::new(Some(TableReference::from("D")), "id")],
+                ),
+                None,
+            )
+            .unwrap()
+            .build()
+            .unwrap();
+
+        // 1) Extract join graph
+        let graph = extract_join_graph(&abcd)
+            .expect("extract_join_graph should succeed")
+            .expect("expected a join graph for four-way join");
+
+        assert_eq!(graph.relations.len(), 4);
+
+        // 2) Assign base cardinalities such that C and D are *clearly* the best pair:
+        //
+        //   |A| = 1000
+        //   |B| = 100
+        //   |C| = 1
+        //   |D| = 1
+        //
+        // Under the SimpleCardinalityCostModel, joining C ⋈ D first
+        // should be very attractive compared to any pair involving A or B.
+        let mut base = vec![1.0_f64; graph.relations.len()];
+        for rel in &graph.relations {
+            base[rel.id] = match rel.name.as_str() {
+                "A" | "a" => 1000.0,
+                "B" | "b" => 100.0,
+                "C" | "c" => 1.0,
+                "D" | "d" => 1.0,
+                other => panic!("unexpected relation name in test: {other}"),
+            };
+        }
+
+        let model = SimpleCardinalityCostModel {
+            base_cardinalities: Some(&base),
+        };
+
+        // 3) Run DP
+        let result = dphyp_optimize_join_graph(&graph, &model)
+            .expect("expected a DP result for four-way join");
+
+        // 4) Compute naive cost for sanity
+        let (naive_cost, _, naive_mask) =
+            naive_cost_for_plan(&abcd, &graph, &model);
+        assert_eq!(
+            naive_mask, result.full_subset,
+            "naive plan and DP plan should span the same subset"
+        );
+
+        let root = result
+            .plans
+            .get(&result.full_subset)
+            .expect("plan for full subset {A,B,C,D}");
+
+        // DP should not be worse than naive
+        assert!(
+            root.cost <= naive_cost + 1e-6,
+            "DP cost {} should be <= naive cost {}",
+            root.cost,
+            naive_cost
+        );
+
+        // 5) Verify that the optimal plan *actually* uses {C,D} as a binary join step.
+        //
+        // Find the ids for C and D in the extracted graph.
+        let mut id_c = None;
+        let mut id_d = None;
+        for rel in &graph.relations {
+            match rel.name.as_str() {
+                "C" | "c" => id_c = Some(rel.id),
+                "D" | "d" => id_d = Some(rel.id),
+                _ => {}
+            }
+        }
+        let id_c = id_c.expect("relation C must be present");
+        let id_d = id_d.expect("relation D must be present");
+
+        let mask_cd: BitSet = (1u64 << id_c) | (1u64 << id_d);
+
+        let mut pair_subsets = Vec::new();
+        collect_pair_subsets(&result, result.full_subset, &mut pair_subsets);
+
+        assert!(
+            pair_subsets.contains(&mask_cd),
+            "optimal DP plan should include {{C,D}} as a 2-way join; got pairs {:?}",
+            pair_subsets
+                .into_iter()
+                .map(|m| format!("{:#b}", m))
+                .collect::<Vec<_>>()
+        );
+    }
+    
 }
