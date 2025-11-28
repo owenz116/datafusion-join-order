@@ -3,7 +3,9 @@ use std::sync::Arc;
 
 use datafusion_common::{Column, DataFusionError, Result as DFResult, TableReference};
 use datafusion_common::tree_node::{TreeNode, TreeNodeRecursion};
-use datafusion_expr::logical_plan::{Join, LogicalPlan, SubqueryAlias, TableScan};
+use datafusion_expr::logical_plan::{
+    Join, LogicalPlan, SubqueryAlias, TableScan, LogicalPlanBuilder,
+};
 use datafusion_expr::{Expr, JoinConstraint, JoinType};
 
 
@@ -353,9 +355,6 @@ pub fn dphyp_optimize_join_graph<M: DPhypCostModel>(
     // ---- base relations (singletons) ----
     for rel in 0..n {
         let mask = 1u64 << rel;
-        if !is_connected_mask(mask, &neighbors) {
-            continue;
-        }
 
         let (base_cost, base_card) = model.base_cost_cardinality(rel, graph);
         plans.insert(
@@ -519,6 +518,154 @@ fn has_cross_edge(a: BitSet, b: BitSet, neighbors: &[BitSet]) -> bool {
     }
     false
 }
+
+/// Rebuild the best join plan (LogicalPlan) for a join island
+/// described by `graph`, using the DP table in `dp`.
+///
+/// This uses the `full_subset` bitmask as the island root.
+pub fn build_best_join_plan_from_dphyp(
+    graph: &JoinGraph,
+    dp: &DPhypResult,
+) -> DFResult<LogicalPlan> {
+    build_plan_for_subset(dp.full_subset, graph, dp)
+}
+
+/// Recursively rebuild a plan for a subset:
+///  - If subset is a singleton → return the base relation LogicalPlan
+///  - Else → recurse into left/right subsets and join them with the
+///    predicates crossing the cut.
+fn build_plan_for_subset(
+    subset: BitSet,
+    graph: &JoinGraph,
+    dp: &DPhypResult,
+) -> DFResult<LogicalPlan> {
+    let entry = dp
+        .plans
+        .get(&subset)
+        .ok_or_else(|| DataFusionError::Internal(format!(
+            "DPhyp reconstruction: no DP entry for subset {subset:b}"
+        )))?;
+
+    match (entry.left, entry.right) {
+        (Some(left_subset), Some(right_subset)) => {
+            // Non-leaf: recursively build children and then a Join
+            let left_plan = build_plan_for_subset(left_subset, graph, dp)?;
+            let right_plan = build_plan_for_subset(right_subset, graph, dp)?;
+
+            build_join_for_children(left_subset, &left_plan, right_subset, &right_plan, graph)
+        }
+        (None, None) => {
+            // Leaf: subset should contain exactly one relation bit
+            let rel_idx = subset.trailing_zeros() as usize;
+
+            if rel_idx >= graph.relations.len() {
+                return Err(DataFusionError::Internal(format!(
+                    "DPhyp reconstruction: subset {subset:b} refers to relation {rel_idx}, \
+                     but graph only has {} relations",
+                    graph.relations.len()
+                )));
+            }
+
+            Ok(graph.relations[rel_idx].plan.clone())
+        }
+        _ => Err(DataFusionError::Internal(format!(
+            "DPhyp reconstruction: malformed DP entry for subset {subset:b} \
+             (expected either both children or none)"
+        ))),
+    }
+}
+
+/// Build a Join node from two child plans and their subsets.
+///
+/// This:
+/// - collects all edges in the join graph that cross the (left_subset, right_subset) cut
+/// - orients each pair so that `left_cols[i]` refers to the left child,
+///   `right_cols[i]` refers to the right child
+/// - builds a `LogicalPlan` via `LogicalPlanBuilder::join`
+fn build_join_for_children(
+    left_subset: BitSet,
+    left_plan: &LogicalPlan,
+    right_subset: BitSet,
+    right_plan: &LogicalPlan,
+    graph: &JoinGraph,
+) -> DFResult<LogicalPlan> {
+    let (left_cols, right_cols) = join_keys_for_cut(left_subset, right_subset, graph)?;
+
+    if left_cols.is_empty() {
+        return Err(DataFusionError::Plan(
+            "DPhyp reconstruction: no join predicates across cut".to_string(),
+        ));
+    }
+
+    LogicalPlanBuilder::from(left_plan.clone())
+        .join(
+            right_plan.clone(),
+            JoinType::Inner, // Commit 1 + 2 only handle inner joins
+            (left_cols, right_cols),
+            None,            // no extra filter, only equi-join keys
+        )?
+        .build()
+}
+
+/// For a given cut (left_subset, right_subset), collect all ON-clause
+/// columns from `graph.edges` that connect a relation in left_subset
+/// with a relation in right_subset.
+///
+/// We must be careful about orientation: each JoinEdge is stored with
+/// endpoints (edge.left, edge.right) and `edge.on` is a Vec<(Expr, Expr)>
+/// with that ordering. But in the DP plan, either relation might end up
+/// in the left or the right subset. So we may need to flip the pair.
+fn join_keys_for_cut(
+    left_subset: BitSet,
+    right_subset: BitSet,
+    graph: &JoinGraph,
+) -> DFResult<(Vec<Column>, Vec<Column>)> {
+    let mut left_cols = Vec::new();
+    let mut right_cols = Vec::new();
+
+    for edge in &graph.edges {
+        let left_bit = 1u64 << edge.left;
+        let right_bit = 1u64 << edge.right;
+
+        let left_in_left = (left_subset & left_bit) != 0;
+        let left_in_right = (right_subset & left_bit) != 0;
+        let right_in_left = (left_subset & right_bit) != 0;
+        let right_in_right = (right_subset & right_bit) != 0;
+
+        // Edge crosses the cut if one endpoint is on the left side and
+        // the other is on the right side (in either orientation).
+        let crosses_normal = left_in_left && right_in_right;
+        let crosses_flipped = right_in_left && left_in_right;
+
+        if !crosses_normal && !crosses_flipped {
+            continue;
+        }
+
+        let flipped = crosses_flipped;
+
+        for (l_expr, r_expr) in &edge.on {
+            let (l_col, r_col) = match (as_column(l_expr), as_column(r_expr)) {
+                (Some(lc), Some(rc)) => (lc, rc),
+                _ => {
+                    // Should not happen: Commit 1 only adds Expr::Column pairs
+                    continue;
+                }
+            };
+
+            if !flipped {
+                left_cols.push(l_col.clone());
+                right_cols.push(r_col.clone());
+            } else {
+                // Swap orientation so left_cols always refer to the left child.
+                left_cols.push(r_col.clone());
+                right_cols.push(l_col.clone());
+            }
+        }
+    }
+
+    Ok((left_cols, right_cols))
+}
+
 
 
 /// Cost model for DPhyp-style DP over a `JoinGraph`.
@@ -1137,5 +1284,210 @@ mod tests {
                 .collect::<Vec<_>>()
         );
     }
-    
+
+    use super::*;
+    use std::collections::HashSet;
+    use datafusion_common::{Column, TableReference};
+
+    /// Collect an unordered set of relation names from a JoinGraph
+    fn relation_name_set(graph: &JoinGraph) -> HashSet<String> {
+        graph
+            .relations
+            .iter()
+            .map(|r| r.name.clone())
+            .collect::<HashSet<_>>()
+    }
+
+    /// Collect an unordered set of edges as (min(name1, name2), max(name1, name2)).
+    fn unordered_edge_name_set(graph: &JoinGraph) -> HashSet<(String, String)> {
+        let mut set = HashSet::new();
+
+        for edge in &graph.edges {
+            let left_name = &graph.relations[edge.left].name;
+            let right_name = &graph.relations[edge.right].name;
+
+            let (a, b) = if left_name <= right_name {
+                (left_name.clone(), right_name.clone())
+            } else {
+                (right_name.clone(), left_name.clone())
+            };
+
+            set.insert((a, b));
+        }
+
+        set
+    }
+
+    /// Helper to build a Column(Expr) for `tref.col_name`.
+    fn col_ref(tref: &TableReference, col_name: &str) -> Expr {
+        Expr::Column(Column::new(Some(tref.clone()), col_name))
+    }
+
+    /// 3-way chain a - b - c:
+    ///
+    ///   a.id = b.id
+    ///   b.id = c.id
+    ///
+    /// Run:
+    ///   JoinGraph -> DP -> LogicalPlan -> extract_join_graph
+    ///
+    /// and check that relations and edges are preserved (as sets).
+    #[test]
+    fn dphyp_reconstruction_roundtrips_three_way_graph() {
+        // base relations: a, b, c
+        let a_plan = dummy_scan("a");
+        let b_plan = dummy_scan("b");
+        let c_plan = dummy_scan("c");
+
+        let a_ref = TableReference::bare("a");
+        let b_ref = TableReference::bare("b");
+        let c_ref = TableReference::bare("c");
+
+        let relations = vec![
+            JoinRelation {
+                id: 0,
+                name: "a".to_string(),
+                plan: a_plan,
+                filters: vec![],
+            },
+            JoinRelation {
+                id: 1,
+                name: "b".to_string(),
+                plan: b_plan,
+                filters: vec![],
+            },
+            JoinRelation {
+                id: 2,
+                name: "c".to_string(),
+                plan: c_plan,
+                filters: vec![],
+            },
+        ];
+
+        // edges: a - b, b - c
+        let edges = vec![
+            JoinEdge {
+                left: 0,
+                right: 1,
+                on: vec![(col_ref(&a_ref, "id"), col_ref(&b_ref, "id"))],
+            },
+            JoinEdge {
+                left: 1,
+                right: 2,
+                on: vec![(col_ref(&b_ref, "id"), col_ref(&c_ref, "id"))],
+            },
+        ];
+
+        let graph = JoinGraph { relations, edges };
+
+        // Run DP with the simple placeholder cost model
+        let model = SimpleCardinalityCostModel { base_cardinalities: None };
+        let dp = dphyp_optimize_join_graph(&graph, &model)
+            .expect("DP optimization should succeed for connected 3-way graph");
+
+        // Rebuild a logical plan from the DP result
+        let rebuilt_plan =
+            build_best_join_plan_from_dphyp(&graph, &dp).expect("rebuild plan");
+
+        // Extract a JoinGraph from the rebuilt plan using Commit 1
+        let rebuilt_graph = extract_join_graph(&rebuilt_plan)
+            .expect("extract_join_graph on rebuilt plan should succeed")
+            .expect("rebuilt plan should yield some JoinGraph");
+
+        // Compare relation sets
+        let orig_relations = relation_name_set(&graph);
+        let rebuilt_relations = relation_name_set(&rebuilt_graph);
+        assert_eq!(orig_relations, rebuilt_relations);
+
+        // Compare unordered edge sets by relation name
+        let orig_edges = unordered_edge_name_set(&graph);
+        let rebuilt_edges = unordered_edge_name_set(&rebuilt_graph);
+        assert_eq!(orig_edges, rebuilt_edges);
+    }
+
+    /// 4-way chain a - b - c - d:
+    ///
+    ///   a.id = b.id
+    ///   b.id = c.id
+    ///   c.id = d.id
+    ///
+    /// Same round-trip test as above but with a larger island.
+    #[test]
+    fn dphyp_reconstruction_roundtrips_four_way_graph() {
+        let a_plan = dummy_scan("a");
+        let b_plan = dummy_scan("b");
+        let c_plan = dummy_scan("c");
+        let d_plan = dummy_scan("d");
+
+        let a_ref = TableReference::bare("a");
+        let b_ref = TableReference::bare("b");
+        let c_ref = TableReference::bare("c");
+        let d_ref = TableReference::bare("d");
+
+        let relations = vec![
+            JoinRelation {
+                id: 0,
+                name: "a".to_string(),
+                plan: a_plan,
+                filters: vec![],
+            },
+            JoinRelation {
+                id: 1,
+                name: "b".to_string(),
+                plan: b_plan,
+                filters: vec![],
+            },
+            JoinRelation {
+                id: 2,
+                name: "c".to_string(),
+                plan: c_plan,
+                filters: vec![],
+            },
+            JoinRelation {
+                id: 3,
+                name: "d".to_string(),
+                plan: d_plan,
+                filters: vec![],
+            },
+        ];
+
+        let edges = vec![
+            JoinEdge {
+                left: 0,
+                right: 1,
+                on: vec![(col_ref(&a_ref, "id"), col_ref(&b_ref, "id"))],
+            },
+            JoinEdge {
+                left: 1,
+                right: 2,
+                on: vec![(col_ref(&b_ref, "id"), col_ref(&c_ref, "id"))],
+            },
+            JoinEdge {
+                left: 2,
+                right: 3,
+                on: vec![(col_ref(&c_ref, "id"), col_ref(&d_ref, "id"))],
+            },
+        ];
+
+        let graph = JoinGraph { relations, edges };
+
+        let model = SimpleCardinalityCostModel { base_cardinalities: None };
+        let dp = dphyp_optimize_join_graph(&graph, &model)
+            .expect("DP optimization should succeed for connected 4-way graph");
+
+        let rebuilt_plan =
+            build_best_join_plan_from_dphyp(&graph, &dp).expect("rebuild plan");
+
+        let rebuilt_graph = extract_join_graph(&rebuilt_plan)
+            .expect("extract_join_graph on rebuilt plan should succeed")
+            .expect("rebuilt plan should yield some JoinGraph");
+
+        let orig_relations = relation_name_set(&graph);
+        let rebuilt_relations = relation_name_set(&rebuilt_graph);
+        assert_eq!(orig_relations, rebuilt_relations);
+
+        let orig_edges = unordered_edge_name_set(&graph);
+        let rebuilt_edges = unordered_edge_name_set(&rebuilt_graph);
+        assert_eq!(orig_edges, rebuilt_edges);
+    }
 }
