@@ -31,6 +31,22 @@ pub struct JoinRelation {
     pub filters: Vec<Expr>,
 }
 
+/// A join predicate hyperedge over one or more relations.
+///
+/// In the Moerkotte/Neumann terminology, this is the query hypergraph
+/// edge: all relations whose columns appear in the equality predicate.
+#[derive(Debug, Clone)]
+pub struct JoinPredicate {
+    /// Bitset of relations (indices into `JoinGraph.relations`) that
+    /// this predicate references.
+    pub rel_mask: BitSet,
+    /// The full equality expression, e.g. `a.x + b.y = c.z + d.w`.
+    ///
+    /// For simple column = column joins this will just be `a.x = b.y`.
+    pub expr: Expr,
+}
+
+
 /// A binary equi-join edge between two relations in the join graph.
 ///
 /// Moerkotte/Neumann generalize this to hyperedges and arbitrary
@@ -46,12 +62,17 @@ pub struct JoinEdge {
     pub on: Vec<(Expr, Expr)>,
 }
 
-/// A join island expressed as a graph over base relations.
+/// A join island expressed as a graph / hypergraph over base relations.
 #[derive(Debug, Clone)]
 pub struct JoinGraph {
     pub relations: Vec<JoinRelation>,
+    /// Pairwise edges used mainly for “classic” 2-way equijoins.
     pub edges: Vec<JoinEdge>,
+    /// Hyperedges over arbitrary sets of relations, one per equality
+    /// predicate in the logical join tree.
+    pub predicates: Vec<JoinPredicate>,
 }
+
 
 /// High-level entry point: given a logical plan node that is either
 /// - a single INNER equi-join, possibly nested, or
@@ -71,20 +92,24 @@ pub fn extract_join_graph(root: &LogicalPlan) -> DFResult<Option<JoinGraph>> {
     let graph = JoinGraph {
         relations: builder.relations,
         edges: builder.edges,
+        predicates: builder.predicates,
     };
-
-    if graph.relations.len() >= 2 && !graph.edges.is_empty() {
+    
+    if graph.relations.len() >= 2 && (!graph.edges.is_empty() || !graph.predicates.is_empty()) {
         Ok(Some(graph))
     } else {
         Ok(None)
     }
+
 }
 
-/// Internal helper for building a JoinGraph.
+
 #[derive(Default)]
 struct GraphBuilder {
     relations: Vec<JoinRelation>,
     edges: Vec<JoinEdge>,
+    /// All join predicates as hyperedges.
+    predicates: Vec<JoinPredicate>,
     /// Map from relation (table / alias) to `relations` index.
     name_to_id: HashMap<TableReference, usize>,
     /// Did we see only “safe” inner equi-joins?
@@ -92,6 +117,72 @@ struct GraphBuilder {
 }
 
 impl GraphBuilder {
+    /// Collect the set of relation-ids referenced by `expr` using
+    /// Expr::column_refs(), and (optionally) return a single relation-id
+    /// if all columns in `expr` come from the same relation.
+    fn rel_mask_and_single_id_for_expr(
+        &self,
+        expr: &Expr,
+    ) -> DFResult<(BitSet, Option<usize>)> {
+        use std::collections::HashSet;
+
+        let cols: HashSet<&Column> = expr.column_refs();
+
+        let mut mask: BitSet = 0;
+        let mut single: Option<usize> = None;
+
+        for col in cols {
+            let tref = match &col.relation {
+                Some(r) => r,
+                None => {
+                    // We require qualified columns inside join keys so we can
+                    // map them to base relations in this island.
+                    return Err(DataFusionError::Plan(format!(
+                        "Moerkotte join graph: unqualified column {} in join expression",
+                        col.name
+                    )));
+                }
+            };
+
+            let rel_id = self.lookup_relation_id(tref)?;
+            let bit = 1u64 << rel_id;
+            if mask & bit == 0 {
+                mask |= bit;
+
+                match single {
+                    None => single = Some(rel_id),
+                    Some(prev) if prev == rel_id => {
+                        // still only one relation so far
+                    }
+                    Some(_) => {
+                        // expression references multiple relations
+                        single = None;
+                    }
+                }
+            }
+        }
+
+        Ok((mask, single))
+    }
+
+    /// Add (or extend) a simple 2-way JoinEdge between `left` and `right`
+    /// for a single ON pair (l_expr, r_expr).
+    fn add_binary_edge(&mut self, left: usize, right: usize, l_expr: Expr, r_expr: Expr) {
+        let (a, b) = if left <= right { (left, right) } else { (right, left) };
+        if let Some(edge) = self
+            .edges
+            .iter_mut()
+            .find(|e| (e.left == a && e.right == b) || (e.left == b && e.right == a))
+        {
+            edge.on.push((l_expr, r_expr));
+        } else {
+            self.edges.push(JoinEdge {
+                left: a,
+                right: b,
+                on: vec![(l_expr, r_expr)],
+            });
+        }
+    }
     /// Recursively walk the plan. Returns `Ok(true)` if this subtree
     /// is entirely made of inner equi-joins + base relations.
     fn walk(&mut self, plan: &LogicalPlan) -> DFResult<bool> {
@@ -127,68 +218,57 @@ impl GraphBuilder {
         }
 
         // At this point we have populated `relations` and `name_to_id`
-        // with all base relations under this join. Now map ON-clause
-        // column pairs to relation indices.
-        //
-        // For Commit 1 we assume each side is a simple Column with a
-        // non-empty `relation` field that identifies the base.
-        let mut edge_pairs: Vec<(Expr, Expr)> = Vec::new();
-        let mut left_rel_id: Option<usize> = None;
-        let mut right_rel_id: Option<usize> = None;
-
+        // with all base relations under this join. Now map each ON-clause
+        // equality to:
+        //   * a JoinPredicate hyperedge over all referenced relations
+        //   * optionally, a 2-way JoinEdge if each side touches exactly
+        //     one relation and they differ.
         for (l_expr, r_expr) in &join.on {
-            let (l_col, r_col) = match (as_column(l_expr), as_column(r_expr)) {
-                (Some(lc), Some(rc)) => (lc, rc),
-                _ => {
-                    // non-column or expression join keys => not supported in this phase
-                    self.ok = false;
-                    return Ok(false);
-                }
-            };
+            // Build hyperedge: union of all relation ids in l_expr and r_expr.
+            let (left_mask, left_single) =
+                match self.rel_mask_and_single_id_for_expr(l_expr) {
+                    Ok(v) => v,
+                    Err(_) => {
+                        self.ok = false;
+                        return Ok(false);
+                    }
+                };
+            let (right_mask, right_single) =
+                match self.rel_mask_and_single_id_for_expr(r_expr) {
+                    Ok(v) => v,
+                    Err(_) => {
+                        self.ok = false;
+                        return Ok(false);
+                    }
+                };
 
-            let l_ref = match &l_col.relation {
-                Some(r) => r,
-                None => {
-                    self.ok = false;
-                    return Ok(false);
-                }
-            };
-            let r_ref = match &r_col.relation {
-                Some(r) => r,
-                None => {
-                    self.ok = false;
-                    return Ok(false);
-                }
-            };
-
-            let l_id = self.lookup_relation_id(l_ref)?;
-            let r_id = self.lookup_relation_id(r_ref)?;
-
-            // Record that this edge connects l_id and r_id. All pairs in this join
-            // share the same endpoints in the simple equi-join case.
-            left_rel_id.get_or_insert(l_id);
-            right_rel_id.get_or_insert(r_id);
-
-            // Sanity: if multiple pairs disagree on which relations they connect, bail.
-            if left_rel_id != Some(l_id) || right_rel_id != Some(r_id) {
+            let rel_mask = left_mask | right_mask;
+            if rel_mask == 0 {
+                // Should not happen for a valid equi-join, but be defensive.
                 self.ok = false;
                 return Ok(false);
             }
 
-            edge_pairs.push((l_expr.clone(), r_expr.clone()));
-        }
+            // Record hyperedge for the full equality.
+            self.predicates.push(JoinPredicate {
+                rel_mask,
+                expr: l_expr.clone().eq(r_expr.clone()),
+            });
 
-        if edge_pairs.is_empty() {
-            // Should not happen for a valid equi-join, but be defensive.
-            self.ok = false;
-            return Ok(false);
+            // If this ON pair is "simple" (each side references exactly one
+            // relation, and they are different), keep a binary edge as well.
+            if let (Some(l_id), Some(r_id)) = (left_single, right_single) {
+                if l_id != r_id {
+                    self.add_binary_edge(l_id, r_id, l_expr.clone(), r_expr.clone());
+                } else {
+                    // Equality within the same relation (e.g. self-join key),
+                    // not useful as a join edge here.
+                }
+            } else {
+                // True hyperedge like a.x + b.y = c.z + d.w: we only keep it
+                // in `predicates` (hypergraph), no simple JoinEdge.
+            }
         }
-
-        self.edges.push(JoinEdge {
-            left: left_rel_id.expect("left_rel_id must be set"),
-            right: right_rel_id.expect("right_rel_id must be set"),
-            on: edge_pairs,
-        });
 
         Ok(true)
     }
@@ -401,7 +481,7 @@ pub fn dphyp_optimize_join_graph<M: DPhypCostModel>(
                 }
             };
 
-            if !has_cross_edge(left_mask, right_mask, &neighbors) {
+            if !has_cross_edge(left_mask, right_mask, graph) {
                 sub = (sub - 1) & subset;
                 continue;
             }
@@ -452,22 +532,45 @@ pub fn dphyp_optimize_join_graph<M: DPhypCostModel>(
         full_subset: full_mask,
     })
 }
-
-
-/// Build bitset neighbor masks for each relation in the join graph.
+/// Build bitset neighbor masks for each relation in the join hypergraph.
 ///
-/// neighbors[i] has bits set for all j such that there is an edge i <-> j.
+/// neighbors[i] has bits set for all j such that there exists at least one
+/// join predicate whose `rel_mask` contains *both* i and j.
+/// Build bitset neighbor masks for each relation in the join hypergraph.
+///
+/// neighbors[i] has bits set for all j such that there exists at least one
+/// join predicate or binary join edge whose support contains *both* i and j.
 fn build_neighbor_masks(graph: &JoinGraph) -> Vec<BitSet> {
     let n = graph.relations.len();
     let mut neighbors = vec![0u64; n];
-    for e in &graph.edges {
-        if e.left < n && e.right < n {
-            neighbors[e.left] |= 1u64 << e.right;
-            neighbors[e.right] |= 1u64 << e.left;
+
+    // 1) Hyperedges: project each predicate's rel_mask to a clique
+    for pred in &graph.predicates {
+        let mut rels = pred.rel_mask;
+
+        while rels != 0 {
+            let i = rels.trailing_zeros() as usize;
+            let bit_i = 1u64 << i;
+            rels ^= bit_i;
+
+            let others = pred.rel_mask ^ bit_i;
+            neighbors[i] |= others;
         }
     }
+
+    // 2) Simple edges: also connect left/right directly
+    for edge in &graph.edges {
+        if edge.left < n && edge.right < n {
+            let l_bit = 1u64 << edge.left;
+            let r_bit = 1u64 << edge.right;
+            neighbors[edge.left] |= r_bit;
+            neighbors[edge.right] |= l_bit;
+        }
+    }
+
     neighbors
 }
+
 
 /// Count bits in a BitSet.
 fn bit_count(mask: BitSet) -> usize {
@@ -504,20 +607,39 @@ fn is_connected_mask(mask: BitSet, neighbors: &[BitSet]) -> bool {
 
     visited == mask
 }
-
-/// Check whether there is any edge crossing the cut (A, B).
-fn has_cross_edge(a: BitSet, b: BitSet, neighbors: &[BitSet]) -> bool {
-    let mut tmp = a;
-    while tmp != 0 {
-        let idx = tmp.trailing_zeros() as usize;
-        let bit = 1u64 << idx;
-        tmp ^= bit;
-        if neighbors[idx] & b != 0 {
+/// Check whether there is any join condition crossing the cut (A, B).
+///
+/// We treat both:
+///   - hyperedges in `graph.predicates` (support sets with > 1 rel)
+///   - simple binary edges in `graph.edges`
+///
+/// as evidence that the cut is "joinable" (i.e., not a pure cross product).
+fn has_cross_edge(a: BitSet, b: BitSet, graph: &JoinGraph) -> bool {
+    // 1) Hyperedges: any predicate whose support intersects both A and B
+    for pred in &graph.predicates {
+        let mask = pred.rel_mask;
+        if (mask & a) != 0 && (mask & b) != 0 {
             return true;
         }
     }
+
+    // 2) Simple binary edges: any edge connecting a relation in A to one in B
+    for edge in &graph.edges {
+        let left_bit = 1u64 << edge.left;
+        let right_bit = 1u64 << edge.right;
+
+        let crosses =
+            (left_bit & a != 0 && right_bit & b != 0) ||
+                (left_bit & b != 0 && right_bit & a != 0);
+
+        if crosses {
+            return true;
+        }
+    }
+
     false
 }
+
 
 /// Rebuild the best join plan (LogicalPlan) for a join island
 /// described by `graph`, using the DP table in `dp`.
@@ -747,7 +869,7 @@ mod tests {
     use std::sync::Arc;
 
     use arrow::datatypes::{DataType, Field, Schema};
-    use datafusion_common::Result as DFResult;
+    use datafusion_common::{Result as DFResult, Spans};
     use datafusion_expr::{
         logical_plan::LogicalPlanBuilder,
         Expr,
@@ -849,8 +971,10 @@ mod tests {
                 on: vec![],
             },
         ];
+        
+        let predicates = vec![];
 
-        let graph = JoinGraph { relations, edges };
+        let graph = JoinGraph { relations, edges, predicates };
 
         // base cardinalities: |A| = 1000, |B| = 10
         let base = [1000.0_f64, 10.0_f64];
@@ -940,7 +1064,9 @@ mod tests {
             },
         ];
 
-        let graph = JoinGraph { relations, edges };
+        let predicates = vec![];
+
+        let graph = JoinGraph { relations, edges, predicates };
 
         let base = [1000.0_f64, 10.0_f64, 1.0_f64];
 
@@ -1378,7 +1504,9 @@ mod tests {
             },
         ];
 
-        let graph = JoinGraph { relations, edges };
+        let predicates = vec![];
+
+        let graph = JoinGraph { relations, edges, predicates };
 
         // Run DP with the simple placeholder cost model
         let model = SimpleCardinalityCostModel { base_cardinalities: None };
@@ -1469,7 +1597,9 @@ mod tests {
             },
         ];
 
-        let graph = JoinGraph { relations, edges };
+        let predicates = vec![];
+
+        let graph = JoinGraph { relations, edges, predicates };
 
         let model = SimpleCardinalityCostModel { base_cardinalities: None };
         let dp = dphyp_optimize_join_graph(&graph, &model)
@@ -1490,4 +1620,41 @@ mod tests {
         let rebuilt_edges = unordered_edge_name_set(&rebuilt_graph);
         assert_eq!(orig_edges, rebuilt_edges);
     }
+
+    fn column_with_rel(rel: &str, name: &str) -> Expr {
+        Expr::Column(Column {
+            relation: Some(TableReference::bare(rel)),
+            name: name.to_string(),
+            spans: Spans::new()
+        })
+    }
+
+    #[test]
+    fn rel_mask_for_multi_relation_expr() {
+        // Build a dummy GraphBuilder with 4 base relations a, b, c, d
+        let mut gb = GraphBuilder::default();
+        for rel in ["a", "b", "c", "d"] {
+            gb.add_base_relation(&dummy_scan(rel));
+        }
+
+        let expr_left = column_with_rel("a", "id") + column_with_rel("b", "id");
+        let expr_right = column_with_rel("c", "id") + column_with_rel("d", "id");
+
+        let (left_mask, left_single) =
+            gb.rel_mask_and_single_id_for_expr(&expr_left).unwrap();
+        let (right_mask, right_single) =
+            gb.rel_mask_and_single_id_for_expr(&expr_right).unwrap();
+
+        // left side touches a, b; right side touches c, d
+        assert!(left_single.is_none());
+        assert!(right_single.is_none());
+
+        // Check masks have the expected number of bits set.
+        assert_eq!(bit_count(left_mask), 2);
+        assert_eq!(bit_count(right_mask), 2);
+
+        let full = left_mask | right_mask;
+        assert_eq!(bit_count(full), 4);
+    }
+
 }
