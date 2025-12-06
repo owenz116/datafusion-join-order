@@ -1730,4 +1730,147 @@ mod tests {
         assert_eq!(bit_count(full), 4);
     }
 
+    #[test]
+    fn extract_three_way_hyperedge_predicate_from_plan() {
+        use datafusion_common::NullEquality;
+        use datafusion_expr::JoinConstraint;
+        use datafusion_expr::logical_plan::Join;
+
+        // Base scans
+        let a_scan = dummy_scan("a");
+        let b_scan = dummy_scan("b");
+        let c_scan = dummy_scan("c");
+
+        // Left child: a ⋈ b on a.id = b.id  (simple equi join)
+        let ab_join = LogicalPlanBuilder::from(a_scan.clone())
+            .join(
+                b_scan.clone(),
+                JoinType::Inner,
+                (vec!["id"], vec!["id"]),
+                None,
+            )
+            .unwrap()
+            .build()
+            .unwrap();
+
+        let left = Arc::new(ab_join);
+        let right = Arc::new(c_scan.clone());
+
+        // Hyperedge predicate: a.id + b.id = c.id
+        let expr_left = column_with_rel("a", "id") + column_with_rel("b", "id");
+        let expr_right = column_with_rel("c", "id");
+
+        let join = Join::try_new(
+            left,
+            right,
+            vec![(expr_left.clone(), expr_right.clone())],
+            None,
+            JoinType::Inner,
+            JoinConstraint::On,
+            NullEquality::NullEqualsNull,
+        )
+            .unwrap();
+
+        let plan = LogicalPlan::Join(join);
+
+        let graph = extract_join_graph(&plan)
+            .expect("extract_join_graph should succeed")
+            .expect("plan should yield Some(JoinGraph)");
+
+        // We have three base relations
+        assert_eq!(graph.relations.len(), 3);
+
+        // From the inner a=b equi-join we get one binary edge.
+        assert_eq!(graph.edges.len(), 1);
+
+        // Predicates: one for a.id = b.id, one for a.id + b.id = c.id
+        assert_eq!(graph.predicates.len(), 2);
+
+        let mask_counts: Vec<_> = graph
+            .predicates
+            .iter()
+            .map(|p| bit_count(p.rel_mask))
+            .collect();
+
+        // One predicate touches exactly {a,b}
+        assert!(
+            mask_counts.contains(&2),
+            "expected binary predicate for a.id = b.id"
+        );
+        // One predicate touches {a,b,c}
+        assert!(
+            mask_counts.contains(&3),
+            "expected hyperedge predicate touching a,b,c"
+        );
+    }
+
+    #[test]
+    fn dphyp_three_way_hyperedge_graph_produces_plan() {
+        // Base relations A, B, C
+        let rel_a = JoinRelation {
+            id: 0,
+            name: "A".to_string(),
+            plan: dummy_scan("A"),
+            filters: vec![],
+        };
+        let rel_b = JoinRelation {
+            id: 1,
+            name: "B".to_string(),
+            plan: dummy_scan("B"),
+            filters: vec![],
+        };
+        let rel_c = JoinRelation {
+            id: 2,
+            name: "C".to_string(),
+            plan: dummy_scan("C"),
+            filters: vec![],
+        };
+
+        let relations = vec![rel_a, rel_b, rel_c];
+
+        // Build a hyperedge for A.id + B.id = C.id
+        let a_ref = TableReference::bare("A");
+        let b_ref = TableReference::bare("B");
+        let c_ref = TableReference::bare("C");
+
+        let expr_left = col_ref(&a_ref, "id") + col_ref(&b_ref, "id");
+        let expr_right = col_ref(&c_ref, "id");
+
+        let hyper_mask: BitSet = (1u64 << 0) | (1u64 << 1) | (1u64 << 2);
+
+        let predicates = vec![JoinPredicate {
+            rel_mask: hyper_mask,
+            expr: expr_left.eq(expr_right),
+        }];
+
+        // No simple edges at all: connectivity comes purely from the hyperedge.
+        let edges = vec![];
+
+        let graph = JoinGraph {
+            relations,
+            edges,
+            predicates,
+        };
+
+        // Some arbitrary base cardinalities, just to exercise the model.
+        let base = [100.0_f64, 10.0_f64, 1.0_f64];
+        let model = SimpleCardinalityCostModel {
+            base_cardinalities: Some(&base),
+        };
+
+        let result = dphyp_optimize_join_graph(&graph, &model)
+            .expect("DP optimization should succeed for connected hypergraph");
+
+        assert_eq!(result.full_subset, hyper_mask);
+
+        // We should have entries for each singleton and for the full set.
+        for mask in [1u64, 2u64, 4u64, hyper_mask] {
+            assert!(
+                result.plans.contains_key(&mask),
+                "expected plan entry for subset mask {:#b}",
+                mask
+            );
+        }
+    }
+
 }
