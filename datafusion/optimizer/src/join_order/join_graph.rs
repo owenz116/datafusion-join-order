@@ -7,6 +7,7 @@ use datafusion_expr::logical_plan::{
     Join, LogicalPlan, SubqueryAlias, TableScan, LogicalPlanBuilder,
 };
 use datafusion_expr::{Expr, JoinConstraint, JoinType};
+use datafusion_expr::utils::conjunction;
 
 
 type BitSet = u64;
@@ -697,12 +698,57 @@ fn build_plan_for_subset(
     }
 }
 
+/// Build a filter expression for the join node that joins `left_subset` and
+/// `right_subset`.
+///
+/// For each JoinPredicate `p` in the hypergraph, we attach `p.expr` at the
+/// *lowest* join node whose subset contains all relations in `p.rel_mask`
+/// and where `p` crosses the cut (i.e. references at least one relation on
+/// each side).
+///
+/// This mirrors DuckDB's behavior: simple 2-way equi-joins become join keys,
+/// while more complex equalities over multiple relations are kept as filters.
+fn build_filter_for_cut(
+    left_subset: BitSet,
+    right_subset: BitSet,
+    graph: &JoinGraph,
+) -> Option<Expr> {
+    let union = left_subset | right_subset;
+    let mut exprs = Vec::new();
+
+    for pred in &graph.predicates {
+        let mask = pred.rel_mask;
+        if mask == 0 {
+            continue;
+        }
+
+        // Predicate must mention at least one relation from *each* side
+        // of the cut, otherwise it is local to one child and will be
+        // attached lower in the tree.
+        if (mask & left_subset) == 0 || (mask & right_subset) == 0 {
+            continue;
+        }
+
+        // All referenced relations must be available at this node.
+        if (mask & union) != mask {
+            continue;
+        }
+
+        exprs.push(pred.expr.clone());
+    }
+
+    // AND them together if there are any.
+    conjunction(exprs)
+}
+
+
 /// Build a Join node from two child plans and their subsets.
 ///
 /// This:
 /// - collects all edges in the join graph that cross the (left_subset, right_subset) cut
 /// - orients each pair so that `left_cols[i]` refers to the left child,
 ///   `right_cols[i]` refers to the right child
+/// - collects all hyperedge predicates that become valid at this node
 /// - builds a `LogicalPlan` via `LogicalPlanBuilder::join`
 fn build_join_for_children(
     left_subset: BitSet,
@@ -711,23 +757,50 @@ fn build_join_for_children(
     right_plan: &LogicalPlan,
     graph: &JoinGraph,
 ) -> DFResult<LogicalPlan> {
+    // Classic equi-join keys from 2-way JoinEdge entries.
     let (left_cols, right_cols) = join_keys_for_cut(left_subset, right_subset, graph)?;
 
-    if left_cols.is_empty() {
+    // Hyperedge predicates that "cross" this cut and whose relation set
+    // is fully contained in left_subset ∪ right_subset.
+    let filter_expr = build_filter_for_cut(left_subset, right_subset, graph);
+
+    let has_keys = !left_cols.is_empty();
+
+    if !has_keys && filter_expr.is_none() {
+        // DP should never produce such a split: there must be at least
+        // one predicate hyperedge crossing the cut, otherwise the graph
+        // is disconnected. Treat as a safety check.
         return Err(DataFusionError::Plan(
             "DPhyp reconstruction: no join predicates across cut".to_string(),
         ));
     }
 
+    // Case 1: we have equi-join keys (possibly plus extra filters).
+    if has_keys {
+        return LogicalPlanBuilder::from(left_plan.clone())
+            .join(
+                right_plan.clone(),
+                JoinType::Inner, // DPhyp currently only handles inner joins
+                (left_cols, right_cols),
+                filter_expr,
+            )?
+            .build();
+    }
+
+    // Case 2: no binary equi-join keys, but there *is* a hyperedge that
+    // crosses the cut. Build a filter-only join (e.g. nested loop).
     LogicalPlanBuilder::from(left_plan.clone())
         .join(
             right_plan.clone(),
-            JoinType::Inner, // Commit 1 + 2 only handle inner joins
-            (left_cols, right_cols),
-            None,            // no extra filter, only equi-join keys
+            JoinType::Inner,
+            // No key columns; planner will treat this as a non-equi join
+            // with a join filter.
+            (Vec::<Column>::new(), Vec::<Column>::new()),
+            filter_expr,
         )?
         .build()
 }
+
 
 /// For a given cut (left_subset, right_subset), collect all ON-clause
 /// columns from `graph.edges` that connect a relation in left_subset
