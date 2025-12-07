@@ -907,6 +907,101 @@ pub struct SimpleCardinalityCostModel<'a> {
     pub base_cardinalities: Option<&'a [f64]>,
 }
 
+/// Cost model that incorporates per-predicate selectivity.
+///
+/// Cardinality model:
+///   card(S) = (∏ base_card(i) for i in S)
+///             * (∏ sel(p) for all predicates p with rel_mask(p) ⊆ S)
+///
+/// where:
+///   base_card(i)          comes from `base_cardinalities` or defaults to 1.0
+///   sel(p) for predicate `p` comes from `predicate_selectivities[p_index]`
+///   or defaults to 1.0 if not provided.
+///
+/// We deliberately compute `card(S)` from scratch for each subset `S` to
+/// avoid double-counting predicate selectivities across different join
+/// trees: every DP entry for the same subset mask gets the same cardinality.
+pub struct PredicateSelectivityCostModel<'a> {
+    /// Optional per-relation base cardinalities indexed by relation id.
+    pub base_cardinalities: Option<&'a [f64]>,
+    /// Optional per-predicate selectivities indexed by `graph.predicates`
+    /// order. If shorter than `graph.predicates.len()`, missing entries
+    /// default to 1.0.
+    pub predicate_selectivities: Option<&'a [f64]>,
+}
+
+impl<'a> PredicateSelectivityCostModel<'a> {
+    fn base_card(&self, rel_id: usize) -> f64 {
+        self.base_cardinalities
+            .and_then(|v| v.get(rel_id).copied())
+            .unwrap_or(1.0)
+    }
+
+    fn predicate_sel(&self, pred_idx: usize) -> f64 {
+        self.predicate_selectivities
+            .and_then(|v| v.get(pred_idx).copied())
+            .unwrap_or(1.0)
+    }
+
+    /// Compute cardinality for a subset mask from scratch:
+    ///   card(S) = ∏ base_card(i) * ∏ sel(p)
+    /// where `p.rel_mask ⊆ S`.
+    fn subset_cardinality(&self, subset: BitSet, graph: &JoinGraph) -> f64 {
+        let mut card = 1.0_f64;
+
+        // Multiply base cardinalities for all relations in `subset`.
+        let mut mask = subset;
+        while mask != 0 {
+            let i = mask.trailing_zeros() as usize;
+            mask ^= 1u64 << i;
+            card *= self.base_card(i);
+        }
+
+        // Multiply selectivities for all predicates whose support is
+        // fully contained within `subset`.
+        for (idx, pred) in graph.predicates.iter().enumerate() {
+            let rel_mask = pred.rel_mask;
+            if rel_mask != 0 && (rel_mask & subset) == rel_mask {
+                card *= self.predicate_sel(idx);
+            }
+        }
+
+        card
+    }
+}
+
+impl<'a> DPhypCostModel for PredicateSelectivityCostModel<'a> {
+    fn base_cost_cardinality(
+        &self,
+        rel_id: usize,
+        _graph: &JoinGraph,
+    ) -> (f64, f64) {
+        let card = self.base_card(rel_id);
+        // For now we mirror System R-style: base cost = base cardinality.
+        (card, card)
+    }
+
+    fn join_cost_cardinality(
+        &self,
+        left: &DPhypPlanEntry,
+        right: &DPhypPlanEntry,
+        graph: &JoinGraph,
+    ) -> (f64, f64) {
+        let subset = left.subset | right.subset;
+
+        // Compute cardinality of the *result* subset from scratch using
+        // base cards + predicate selectivities.
+        let result_card = self.subset_cardinality(subset, graph);
+
+        // Simple join-cost model: cost contribution of this join step is
+        // proportional to the size of the result.
+        let join_cost = result_card;
+
+        (join_cost, result_card)
+    }
+}
+
+
 impl<'a> DPhypCostModel for SimpleCardinalityCostModel<'a> {
     fn base_cost_cardinality(
         &self,
@@ -1871,6 +1966,114 @@ mod tests {
                 mask
             );
         }
+    }
+
+    #[test]
+    fn predicate_selectivity_influences_three_way_chain_order() {
+        // Graph: A -- B -- C with two predicates:
+        //   p0: A.id = B.id  (very selective)
+        //   p1: B.id = C.id  (less selective)
+        //
+        // Base cardinalities all equal (so only selectivity matters):
+        //   |A| = |B| = |C| = 1000
+        //
+        // With the PredicateSelectivityCostModel, joining A⋈B first
+        // (using p0 sel = 1e-4) should be cheaper than joining B⋈C
+        // first (p1 sel = 1e-2).
+
+        // Base relations A, B, C
+        let rel_a = JoinRelation {
+            id: 0,
+            name: "A".to_string(),
+            plan: dummy_scan("A"),
+            filters: vec![],
+        };
+        let rel_b = JoinRelation {
+            id: 1,
+            name: "B".to_string(),
+            plan: dummy_scan("B"),
+            filters: vec![],
+        };
+        let rel_c = JoinRelation {
+            id: 2,
+            name: "C".to_string(),
+            plan: dummy_scan("C"),
+            filters: vec![],
+        };
+
+        let relations = vec![rel_a, rel_b, rel_c];
+
+        let a_ref = TableReference::bare("A");
+        let b_ref = TableReference::bare("B");
+        let c_ref = TableReference::bare("C");
+
+        // Binary edges: A-B and B-C
+        let edges = vec![
+            JoinEdge {
+                left: 0,
+                right: 1,
+                on: vec![(col_ref(&a_ref, "id"), col_ref(&b_ref, "id"))],
+            },
+            JoinEdge {
+                left: 1,
+                right: 2,
+                on: vec![(col_ref(&b_ref, "id"), col_ref(&c_ref, "id"))],
+            },
+        ];
+
+        // Hypergraph predicates matching the same equalities
+        let predicates = vec![
+            // p0: A.id = B.id  (mask {A,B})
+            JoinPredicate {
+                rel_mask: (1u64 << 0) | (1u64 << 1),
+                expr: col_ref(&a_ref, "id").eq(col_ref(&b_ref, "id")),
+            },
+            // p1: B.id = C.id  (mask {B,C})
+            JoinPredicate {
+                rel_mask: (1u64 << 1) | (1u64 << 2),
+                expr: col_ref(&b_ref, "id").eq(col_ref(&c_ref, "id")),
+            },
+        ];
+
+        let graph = JoinGraph {
+            relations,
+            edges,
+            predicates,
+        };
+
+        // Base cardinalities: all equal
+        let base = [1000.0_f64, 1000.0_f64, 1000.0_f64];
+
+        // Predicate selectivities:
+        //   sel(p0: A=B) = 1e-4  (very selective)
+        //   sel(p1: B=C) = 1e-2  (less selective)
+        let predicate_sels = [1e-4_f64, 1e-2_f64];
+
+        let model = PredicateSelectivityCostModel {
+            base_cardinalities: Some(&base),
+            predicate_selectivities: Some(&predicate_sels),
+        };
+
+        let result =
+            dphyp_optimize_join_graph(&graph, &model).expect("expected DP result");
+
+        assert_eq!(result.full_subset, 0b111);
+
+        // Collect all 2-element subsets used as internal join nodes.
+        let mut pair_subsets = Vec::new();
+        collect_pair_subsets(&result, result.full_subset, &mut pair_subsets);
+
+        // For a 3-way join there should be exactly one 2-relation internal subset.
+        assert_eq!(pair_subsets.len(), 1);
+
+        // Expected best pair is {A,B} (ids 0 and 1)
+        let mask_ab: BitSet = (1u64 << 0) | (1u64 << 1);
+        assert_eq!(
+            pair_subsets[0], mask_ab,
+            "expected {{A,B}} to be the first join pair due to more selective predicate; \
+             got pair mask {:#b}",
+            pair_subsets[0]
+        );
     }
 
 }
