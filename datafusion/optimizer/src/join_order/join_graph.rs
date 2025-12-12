@@ -7,7 +7,8 @@ use datafusion_expr::logical_plan::{
     Join, LogicalPlan, SubqueryAlias, TableScan, LogicalPlanBuilder,
 };
 use datafusion_expr::{Expr, JoinConstraint, JoinType};
-use datafusion_expr::utils::conjunction;
+use datafusion_expr::utils::{conjunction, split_conjunction};
+
 
 
 type BitSet = u64;
@@ -271,6 +272,37 @@ impl GraphBuilder {
             }
         }
 
+        // treat filter predicates as hyperedges too
+        if let Some(filter_expr) = &join.filter {
+            for conjunct in split_conjunction(filter_expr) {
+                // Compute the set of relations this predicate touches.
+                let (rel_mask, _maybe_single) =
+                    match self.rel_mask_and_single_id_for_expr(conjunct) {
+                        Ok(v) => v,
+                        Err(_) => {
+                            // If we can't map the expression cleanly to our relation ids,
+                            // bail out for now: this join tree is not (yet) reorderable.
+                            self.ok = false;
+                            return Ok(false);
+                        }
+                    };
+
+                // Predicates that only touch 0 or 1 relation are "local" filters;
+                // they don't participate in join connectivity.
+                if rel_mask.count_ones() < 2 {
+                    continue;
+                }
+
+                // Record a hyperedge for this filter predicate. Unlike ON pairs,
+                // we don't try to synthesize a binary JoinEdge: this might be a
+                // three- or four-way predicate.
+                self.predicates.push(JoinPredicate {
+                    rel_mask,
+                    expr: conjunct.clone(),
+                });
+            }
+        }
+
         Ok(true)
     }
 
@@ -305,22 +337,17 @@ impl GraphBuilder {
     }
 }
 
-/// Very conservative check: is this join something we are willing to
-/// reorder in Commit 1?
 fn is_reorderable_inner_equi_join(join: &Join) -> bool {
+    // For now we only reorder INNER ... ON joins.
     if join.join_type != JoinType::Inner {
         return false;
     }
     if join.join_constraint != JoinConstraint::On {
         return false;
     }
-    if join.filter.is_some() {
-        // We ignore non-equi predicates for now
-        return false;
-    }
 
-    // ON must be all column = column; we validate this more strictly in handle_join.
-    !join.on.is_empty()
+    // We now allow ON with or without equi-pairs, and arbitrary filter predicates.
+    true
 }
 
 /// Check whether a plan subtree contains any Join nodes at all.
@@ -1037,15 +1064,8 @@ mod tests {
     use std::sync::Arc;
 
     use arrow::datatypes::{DataType, Field, Schema};
-    use datafusion_common::{Result as DFResult, Spans};
-    use datafusion_expr::{
-        logical_plan::LogicalPlanBuilder,
-        Expr,
-        JoinType,
-        LogicalPlan,
-        TableSource,
-        TableProviderFilterPushDown,
-    };
+    use datafusion_common::Spans;
+    use datafusion_expr::{logical_plan::LogicalPlanBuilder, Expr, JoinType, LogicalPlan, TableSource, TableProviderFilterPushDown, BinaryExpr};
 
     #[derive(Debug)]
     struct RawTableSource;
@@ -2076,4 +2096,98 @@ mod tests {
         );
     }
 
+    use datafusion_expr::Operator;
+    #[test]
+    fn filter_only_two_way_join_creates_hyperedge_and_is_reconstructible() {
+        // Build two base relations A and B
+        let a_scan = dummy_scan("a");
+        let b_scan = dummy_scan("b");
+
+        // Build a non-equi join predicate that touches both A and B.
+        // We model "A.cola contains B.colb" as a LIKE for simplicity:
+        //
+        //   a.cola LIKE b.colb
+        //
+        // The hypergraph machinery only cares that the expression
+        // references columns from *both* relations.
+        let a_col_expr = Expr::Column(Column {
+            relation: Some(TableReference::bare("a")),
+            name: "cola".to_string(),
+            spans: Spans::new()
+        });
+        let b_col_expr = Expr::Column(Column {
+            relation: Some(TableReference::bare("b")),
+            name: "colb".to_string(),
+            spans: Spans::new()
+        });
+
+        let filter_expr = Expr::BinaryExpr(BinaryExpr {
+            left: Box::new(a_col_expr),
+            op: Operator::LikeMatch,
+            right: Box::new(b_col_expr),
+        });
+
+        // Build an INNER join with:
+        //   - empty ON key lists
+        //   - the non-equi predicate in `filter`
+        let join_plan = LogicalPlanBuilder::from(a_scan)
+            .join(
+                b_scan,
+                JoinType::Inner,
+                (Vec::<Column>::new(), Vec::<Column>::new()),
+                Some(filter_expr.clone()),
+            )
+            .unwrap()
+            .build()
+            .unwrap();
+
+        // ---- extract join graph ----
+        let graph = extract_join_graph(&join_plan)
+            .expect("extract_join_graph should not error")
+            .expect("expected a join graph for simple inner join");
+
+        // We should have exactly two base relations, no equi-edges,
+        // and one predicate hyperedge over both relations.
+        assert_eq!(graph.relations.len(), 2);
+        assert!(graph.edges.is_empty(), "no equi-join edges expected");
+        assert_eq!(graph.predicates.len(), 1);
+
+        let pred = &graph.predicates[0];
+        // Predicate must reference exactly the two relations in this island.
+        assert_eq!(pred.rel_mask.count_ones(), 2);
+
+        // ---- run DPhyp and reconstruct plan ----
+        let cost_model = SimpleCardinalityCostModel { base_cardinalities: None };
+        let dp = dphyp_optimize_join_graph(&graph, &cost_model)
+            .expect("DP optimization should succeed for connected 2-way graph");
+
+        // Rebuild the best plan from the DP table.
+        let rebuilt = build_best_join_plan_from_dphyp(&graph, &dp)
+            .expect("reconstruction should succeed");
+
+        // The rebuilt plan should be an INNER join with:
+        //   - no ON keys
+        //   - a non-empty filter (our predicate)
+        match rebuilt {
+            LogicalPlan::Join(Join {
+                                  join_type,
+                                  join_constraint,
+                                  on,
+                                  filter,
+                                  ..
+                              }) => {
+                assert_eq!(join_type, JoinType::Inner);
+                assert_eq!(join_constraint, JoinConstraint::On);
+                assert!(
+                    on.is_empty(),
+                    "non-equi join should not have equi key pairs in `on`"
+                );
+                assert!(
+                    filter.is_some(),
+                    "filter-only join must carry the predicate in `filter`"
+                );
+            }
+            other => panic!("expected Join plan after reconstruction, got: {other:?}"),
+        }
+    }
 }
