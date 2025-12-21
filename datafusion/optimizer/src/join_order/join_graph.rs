@@ -2398,5 +2398,240 @@ mod tests {
         );
     }
 
+    #[test]
+    fn optimize_joins_recursively_rewrites_three_way_chain_under_aggregate() {
+        use std::collections::HashMap;
+        use datafusion_expr::col;
+
+        // Base scans with names "a", "b", "c" so they match JoinRelation.name
+        let a_scan = dummy_scan("a");
+        let b_scan = dummy_scan("b");
+        let c_scan = dummy_scan("c");
+
+        // First join: a.id = b.id (unambiguous)
+        let ab_join = LogicalPlanBuilder::from(a_scan)
+            .join(
+                b_scan,
+                JoinType::Inner,
+                (vec!["id"], vec!["id"]),
+                None,
+            )
+            .unwrap()
+            .build()
+            .unwrap();
+
+        // Second join: (a ⋈ b) ⋈ c, explicitly b.id = c.id to avoid ambiguity
+        let left_deep = LogicalPlanBuilder::from(ab_join)
+            .join(
+                c_scan,
+                JoinType::Inner,
+                (vec!["b.id"], vec!["id"]),
+                None,
+            )
+            .unwrap()
+            .build()
+            .unwrap();
+
+        // Wrap the 3-way join in an Aggregate to simulate a non-join operator
+        // above the island. Grouping key choice is arbitrary here.
+        let aggregated = LogicalPlanBuilder::from(left_deep.clone())
+            .aggregate(vec![col("a.id")], Vec::<Expr>::new())
+            .unwrap()
+            .build()
+            .unwrap();
+
+        // Cardinalities chosen so that the optimal plan joins b and c first:
+        //   |a| = 1000, |b| = 10, |c| = 1
+        let mut cards = HashMap::new();
+        cards.insert("a".to_string(), 1000.0);
+        cards.insert("b".to_string(), 10.0);
+        cards.insert("c".to_string(), 1.0);
+        let model = NamedCardinalityCostModel { cards };
+
+        // Sanity: DPhyp over the raw left-deep chain should NOT keep that shape
+        let graph_orig = extract_join_graph(&left_deep)
+            .unwrap()
+            .expect("left-deep chain should be recognized as a join island");
+        let dp_orig =
+            dphyp_optimize_join_graph(&graph_orig, &model).expect("DP should succeed");
+        let best_orig =
+            build_best_join_plan_from_dphyp(&graph_orig, &dp_orig).unwrap();
+
+        assert_ne!(
+            best_orig, left_deep,
+            "left-deep chain should not be cheapest for these cardinalities"
+        );
+
+        // Run the recursive optimizer on the plan rooted at Aggregate
+        let optimized = optimize_joins_in_plan(&aggregated, &model).unwrap();
+
+        // Shape: still an Aggregate at the root
+        let join_under_agg = match optimized {
+            LogicalPlan::Aggregate(agg) => (*agg.input).clone(),
+            other => panic!("expected Aggregate at root, got {other:?}"),
+        };
+
+        // Helper: collect leaf table names under a (possibly nested) join tree
+        fn leaf_relation_names(plan: &LogicalPlan, out: &mut Vec<String>) {
+            match plan {
+                LogicalPlan::Join(j) => {
+                    leaf_relation_names(&j.left, out);
+                    leaf_relation_names(&j.right, out);
+                }
+                LogicalPlan::TableScan(scan) => {
+                    out.push(scan.table_name.table().to_string());
+                }
+                _ => {}
+            }
+        }
+
+        // We only care about which relations are grouped on each side of the
+        // top join, not the exact filter duplication structure.
+        let root_join = match &join_under_agg {
+            LogicalPlan::Join(j) => j,
+            other => panic!("expected Join under Aggregate, got {other:?}"),
+        };
+
+        let mut left_names = Vec::new();
+        let mut right_names = Vec::new();
+        leaf_relation_names(&root_join.left, &mut left_names);
+        leaf_relation_names(&root_join.right, &mut right_names);
+        left_names.sort();
+        right_names.sort();
+
+        // With |a| >> |b|,|c| and the Simple/NamedCardinality cost model,
+        // DPhyp should pick (b ⋈ c) first, then join with a.
+        assert!(
+            (left_names == vec!["a".to_string()] && right_names == vec!["b".to_string(), "c".to_string()])
+                || (right_names == vec!["a".to_string()] && left_names == vec!["b".to_string(), "c".to_string()]),
+            "expected one side of top join to contain {{b,c}} and the other {{a}}, \
+             got left={left_names:?}, right={right_names:?}"
+        );
+    }
+
+    #[test]
+    fn optimize_joins_recursively_respects_outer_join_boundary() {
+        // Inner-join island on a, b, c
+        let a_scan = dummy_scan("a");
+        let b_scan = dummy_scan("b");
+        let c_scan = dummy_scan("c");
+        let d_scan = dummy_scan("d");
+
+        // (a ⋈ b) on a.id = b.id
+        let ab_join = LogicalPlanBuilder::from(a_scan)
+            .join(
+                b_scan,
+                JoinType::Inner,
+                (vec!["id"], vec!["id"]),
+                None,
+            )
+            .unwrap()
+            .build()
+            .unwrap();
+
+        // ((a ⋈ b) ⋈ c) with b.id = c.id
+        let inner_chain = LogicalPlanBuilder::from(ab_join)
+            .join(
+                c_scan,
+                JoinType::Inner,
+                (vec!["b.id"], vec!["id"]),
+                None,
+            )
+            .unwrap()
+            .build()
+            .unwrap();
+
+        // Wrap the inner island on the left side of a LEFT join with d:
+        //   ( (a ⋈ b ⋈ c) LEFT JOIN d ON c.id = d.id )
+        let full_plan = LogicalPlanBuilder::from(inner_chain.clone())
+            .join(
+                d_scan,
+                JoinType::Left,
+                (vec!["c.id"], vec!["id"]),
+                None,
+            )
+            .unwrap()
+            .build()
+            .unwrap();
+
+        // Cardinalities so that the inner island prefers (b ⋈ c) first:
+        //   |a| = 1000, |b| = 10, |c| = 1, |d| arbitrary
+        let mut cards = HashMap::new();
+        cards.insert("a".to_string(), 1000.0);
+        cards.insert("b".to_string(), 10.0);
+        cards.insert("c".to_string(), 1.0);
+        cards.insert("d".to_string(), 5.0);
+        let model = NamedCardinalityCostModel { cards };
+
+        // Run the recursive optimizer on the full plan
+        let optimized = optimize_joins_in_plan(&full_plan, &model).unwrap();
+
+        // Root must remain a LEFT join (outer-join boundary)
+        let (left_child, right_child, join_type) = match &optimized {
+            LogicalPlan::Join(j) => (&*j.left, &*j.right, j.join_type),
+            other => panic!("expected top-level Join, got {other:?}"),
+        };
+
+        assert_eq!(
+            join_type,
+            JoinType::Left,
+            "top-level join should remain a LEFT join boundary"
+        );
+
+        // Helper: collect leaf table names under a (possibly nested) subtree
+        fn leaf_relation_names(plan: &LogicalPlan) -> Vec<String> {
+            let mut names = Vec::new();
+            plan.apply(|node| {
+                if let LogicalPlan::TableScan(ts) = node {
+                    names.push(ts.table_name.table().to_string());
+                }
+                Ok(TreeNodeRecursion::Continue)
+            })
+                .unwrap();
+            names
+        }
+
+        // Right side should still be only table d
+        let mut right_names = leaf_relation_names(right_child);
+        right_names.sort();
+        assert_eq!(
+            right_names,
+            vec!["d".to_string()],
+            "expected right child of LEFT join to be {{d}}, got {right_names:?}"
+        );
+
+        // Left side is the inner island over {a,b,c}
+        let mut left_names = leaf_relation_names(left_child);
+        left_names.sort();
+        assert_eq!(
+            left_names,
+            vec!["a".to_string(), "b".to_string(), "c".to_string()],
+            "expected left child of LEFT join to contain {{a,b,c}}, got {left_names:?}"
+        );
+
+        // We also expect that somewhere inside that left subtree, there is a
+        // sub-join operating exactly on {b,c}, because they are the two
+        // smallest relations in our cost model.
+        let left_join = match left_child {
+            LogicalPlan::Join(j) => j,
+            other => panic!("expected inner island to be a Join, got {other:?}"),
+        };
+
+        let mut child1_names = leaf_relation_names(&left_join.left);
+        let mut child2_names = leaf_relation_names(&left_join.right);
+        child1_names.sort();
+        child2_names.sort();
+
+        let have_bc_subjoin =
+            child1_names == vec!["b".to_string(), "c".to_string()] ||
+                child2_names == vec!["b".to_string(), "c".to_string()];
+
+        assert!(
+            have_bc_subjoin,
+            "expected a sub-join on {{b,c}} inside inner island, \
+             got left child leaves={child1_names:?}, right child leaves={child2_names:?}"
+        );
+    }
+
 
 }
