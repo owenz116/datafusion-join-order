@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use datafusion_common::{Column, DataFusionError, Result as DFResult, TableReference};
-use datafusion_common::tree_node::{TreeNode, TreeNodeRecursion};
+use datafusion_common::tree_node::{TreeNode, TreeNodeRecursion, Transformed};
 use datafusion_expr::logical_plan::{
     Join, LogicalPlan, SubqueryAlias, TableScan, LogicalPlanBuilder,
 };
@@ -1054,6 +1054,71 @@ impl<'a> DPhypCostModel for SimpleCardinalityCostModel<'a> {
     }
 }
 
+/// Run DPhyp-based join order optimization recursively over a plan.
+///
+/// This walks the plan bottom-up using `TreeNode::transform_up`.
+/// For every `LogicalPlan::Join` subtree that can be expressed as a
+/// reorderable join island (`extract_join_graph` returns `Some(..)`),
+/// we invoke `dphyp_optimize_join_graph` and reconstruct the best join
+/// tree for that island.
+///
+/// Non-join operators act as *island boundaries*, but their children
+/// are still visited recursively, so a shape like
+///
+///   Join(
+///     Join(
+///       a,
+///       Filter(
+///         Aggregate(   // <- boundary
+///           D_island   // <- inner join island
+///         )
+///       )
+///     ),
+///     c,
+///   )
+///
+/// will first optimize `D_island`, then leave the outer joins as-is
+/// because they cross the `Filter/Aggregate` boundary.
+pub fn optimize_joins_in_plan<M: DPhypCostModel>(
+    plan: &LogicalPlan,
+    model: &M,
+) -> DFResult<LogicalPlan> {
+    // `transform_up` rewrites children first, then the current node,
+    // which is exactly what we want: optimize inner islands before
+    // deciding what to do with outer joins.
+    let transformed = plan.clone().transform_up(|node| {
+        match node {
+            LogicalPlan::Join(join) => {
+                let join_plan = LogicalPlan::Join(join.clone());
+
+                // Try to view this join subtree as a join island.
+                match extract_join_graph(&join_plan)? {
+                    Some(graph) => {
+                        if let Some(dp) = dphyp_optimize_join_graph(&graph, model) {
+                            let best = build_best_join_plan_from_dphyp(&graph, &dp)?;
+                            Ok(Transformed::yes(best))
+                        } else {
+                            // Graph looked reorderable, but DP couldn't find
+                            // a full plan (e.g. disconnected): leave as-is.
+                            Ok(Transformed::no(join_plan))
+                        }
+                    }
+                    None => {
+                        // Not a pure inner-island according to our extractor
+                        Ok(Transformed::no(join_plan))
+                    }
+                }
+            }
+            other => {
+                // Non-join nodes are left as-is; their children have already
+                // been optimized by the bottom-up traversal.
+                Ok(Transformed::no(other))
+            }
+        }
+    })?;
+
+    Ok(transformed.data)
+}
 
 
 
@@ -1062,6 +1127,9 @@ impl<'a> DPhypCostModel for SimpleCardinalityCostModel<'a> {
 mod tests {
     use super::*;
     use std::sync::Arc;
+    use datafusion_expr::logical_plan::Filter;
+    use datafusion_expr::lit;
+
 
     use arrow::datatypes::{DataType, Field, Schema};
     use datafusion_common::Spans;
@@ -2190,4 +2258,145 @@ mod tests {
             other => panic!("expected Join plan after reconstruction, got: {other:?}"),
         }
     }
+
+    use std::collections::HashMap;
+
+    struct NamedCardinalityCostModel {
+        /// Cardinalities keyed by relation name, e.g. "a", "b", "c".
+        cards: HashMap<String, f64>,
+    }
+
+    impl DPhypCostModel for NamedCardinalityCostModel {
+        fn base_cost_cardinality(
+            &self,
+            rel_id: usize,
+            graph: &JoinGraph,
+        ) -> (f64, f64) {
+            let name = &graph.relations[rel_id].name;
+            let card = self.cards.get(name).copied().unwrap_or(1.0);
+            (card, card)
+        }
+
+        fn join_cost_cardinality(
+            &self,
+            left: &DPhypPlanEntry,
+            right: &DPhypPlanEntry,
+            _graph: &JoinGraph,
+        ) -> (f64, f64) {
+            let result_card = left.cardinality * right.cardinality;
+            let join_cost = result_card;
+            (join_cost, result_card)
+        }
+    }
+
+
+    #[test]
+    fn optimize_joins_recursively_rewrites_three_way_chain_under_filter() {
+        use datafusion_expr::{lit, logical_plan::Filter};
+
+        let a_scan = dummy_scan("a");
+        let b_scan = dummy_scan("b");
+        let c_scan = dummy_scan("c");
+
+        // First join: a.id = b.id
+        let ab_join = LogicalPlanBuilder::from(a_scan)
+            .join(
+                b_scan,
+                JoinType::Inner,
+                (vec!["id"], vec!["id"]),
+                None,
+            )
+            .unwrap()
+            .build()
+            .unwrap();
+
+        // Second join: (a ⋈ b) ⋈ c, explicitly b.id = c.id
+        let left_deep = LogicalPlanBuilder::from(ab_join)
+            .join(
+                c_scan,
+                JoinType::Inner,
+                (vec!["b.id"], vec!["id"]),
+                None,
+            )
+            .unwrap()
+            .build()
+            .unwrap();
+
+        // Wrap the join island in a Filter
+        let filtered = LogicalPlan::Filter(
+            Filter::try_new(lit(true), Arc::new(left_deep.clone())).unwrap(),
+        );
+
+        // Cardinalities keyed by relation name:
+        //   |a| = 1000, |b| = 10, |c| = 1
+        let mut cards = HashMap::new();
+        cards.insert("a".to_string(), 1000.0);
+        cards.insert("b".to_string(), 10.0);
+        cards.insert("c".to_string(), 1.0);
+        let model = NamedCardinalityCostModel { cards };
+
+        // Sanity: DPhyp on the original left-deep chain should NOT leave it as-is.
+        let graph_orig = extract_join_graph(&left_deep)
+            .unwrap()
+            .expect("left-deep chain should be recognized as a join island");
+        let dp_orig =
+            dphyp_optimize_join_graph(&graph_orig, &model).expect("DP should succeed");
+        let best_orig =
+            build_best_join_plan_from_dphyp(&graph_orig, &dp_orig).unwrap();
+        assert_ne!(
+            best_orig, left_deep,
+            "left-deep chain should not be cheapest with these cardinalities"
+        );
+
+        // Now run the recursive optimizer on the *filtered* plan.
+        let optimized = optimize_joins_in_plan(&filtered, &model).unwrap();
+
+        // Still a Filter at the root.
+        let join_under_filter = match optimized {
+            LogicalPlan::Filter(f) => (*f.input).clone(),
+            other => panic!("expected Filter at root, got {other:?}"),
+        };
+
+        // join_under_filter should be a Join whose *left* child is a Join
+        // between exactly {b,c} (in any order).
+        let (left_child, right_child) = match &join_under_filter {
+            LogicalPlan::Join(j) => (j.left.as_ref(), j.right.as_ref()),
+            other => panic!("expected Join under Filter, got {other:?}"),
+        };
+
+        // Collect leaf relation names under the left child of the top join.
+        fn leaf_relation_names(plan: &LogicalPlan) -> Vec<String> {
+            let mut names = Vec::new();
+            plan.apply(|node| {
+                if let LogicalPlan::TableScan(ts) = node {
+                    names.push(ts.table_name.to_string());
+                }
+                Ok(TreeNodeRecursion::Continue)
+            })
+                .unwrap();
+            names
+        }
+
+        let left_leaf_names = leaf_relation_names(left_child);
+
+        // We expect the DP to join b and c first (the two smallest).
+        assert!(
+            left_leaf_names.contains(&"b".to_string())
+                && left_leaf_names.contains(&"c".to_string())
+                && left_leaf_names.len() == 2,
+            "expected left child of top join to be the join of {{b,c}}, got leaves {:?}",
+            left_leaf_names
+        );
+
+        // And the right child should be the remaining relation a.
+        let right_leaf_names = leaf_relation_names(right_child);
+        assert_eq!(
+            right_leaf_names,
+            vec!["a".to_string()],
+            "expected right child of top join to be {{a}}, got leaves {:?}",
+            right_leaf_names
+        );
+    }
+
+
 }
