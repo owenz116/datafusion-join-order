@@ -6,7 +6,7 @@ use datafusion_common::tree_node::{TreeNode, TreeNodeRecursion, Transformed};
 use datafusion_expr::logical_plan::{
     Join, LogicalPlan, SubqueryAlias, TableScan, LogicalPlanBuilder,
 };
-use datafusion_expr::{Expr, JoinConstraint, JoinType};
+use datafusion_expr::{Expr, JoinConstraint, JoinType, Operator};
 use datafusion_expr::utils::{conjunction, split_conjunction};
 
 
@@ -1053,6 +1053,202 @@ impl<'a> DPhypCostModel for SimpleCardinalityCostModel<'a> {
         (join_cost, result_card)
     }
 }
+
+
+/// Provides statistics needed by the join-order cost model.
+///
+/// Intentionally small API:
+/// - base cardinality per relation
+/// - NDV (number of distinct values) per *base column*
+///
+/// You can implement this from:
+/// - catalog / ANALYZE results
+/// - parquet metadata
+/// - DataFusion's Statistics (when available)
+pub trait StatsProvider {
+    /// Base cardinality (row count) for a relation.
+    fn base_cardinality(&self, rel_id: usize, graph: &JoinGraph) -> Option<f64>;
+
+    /// NDV for a base column.
+    fn column_ndv(&self, col: &Column, graph: &JoinGraph) -> Option<f64>;
+}
+
+/// Estimates predicate selectivity using a pluggable policy.
+///
+/// In this commit we provide a default NDV-based estimator for equality.
+/// You can replace/extend this later for LIKE/contains/UDFs/etc.
+pub trait ExpressionSelectivityEstimator {
+    /// Returns selectivity in (0, 1], or None if unknown.
+    fn estimate_selectivity(
+        &self,
+        predicate: &Expr,
+        graph: &JoinGraph,
+        stats: &dyn StatsProvider,
+    ) -> Option<f64>;
+}
+
+/// Default selectivities used as fallbacks.
+#[derive(Debug, Clone, Copy)]
+pub struct SelectivityDefaults {
+    /// Used when we cannot estimate a predicate at all.
+    pub unknown_predicate: f64,
+    /// Used for unknown equality predicates specifically (if you want a different default).
+    pub unknown_equality: f64,
+}
+
+impl Default for SelectivityDefaults {
+    fn default() -> Self {
+        Self {
+            unknown_predicate: 0.25,
+            unknown_equality: 0.1,
+        }
+    }
+}
+
+/// NDV-based estimator:
+/// - For `lhs = rhs`, estimate selectivity as `1 / max(NDV(lhs), NDV(rhs))`
+/// - Otherwise return None (caller applies fallback)
+///
+/// NDV(lhs/rhs) is estimated from referenced base columns:
+/// - if expr is a Column => NDV(column)
+/// - if expr references multiple columns => max NDV among referenced columns
+pub struct NdvExpressionSelectivityEstimator {
+    pub defaults: SelectivityDefaults,
+}
+
+impl NdvExpressionSelectivityEstimator {
+    fn expr_ndv(
+        &self,
+        expr: &Expr,
+        graph: &JoinGraph,
+        stats: &dyn StatsProvider,
+    ) -> Option<f64> {
+        // collect all Column refs inside expr; take max NDV among them
+        let mut max_ndv: Option<f64> = None;
+
+        let _ = expr.apply(|e| {
+            if let Expr::Column(c) = e {
+                if let Some(ndv) = stats.column_ndv(c, graph) {
+                    max_ndv = Some(match max_ndv {
+                        Some(cur) => cur.max(ndv),
+                        None => ndv,
+                    });
+                }
+            }
+            Ok(TreeNodeRecursion::Continue)
+        });
+
+        max_ndv
+    }
+}
+
+impl ExpressionSelectivityEstimator for NdvExpressionSelectivityEstimator {
+    fn estimate_selectivity(
+        &self,
+        predicate: &Expr,
+        graph: &JoinGraph,
+        stats: &dyn StatsProvider,
+    ) -> Option<f64> {
+        // Only handle equality right now.
+        let Expr::BinaryExpr(be) = predicate else {
+            return None;
+        };
+        if be.op != Operator::Eq {
+            return None;
+        }
+
+        let l_ndv = self.expr_ndv(&be.left, graph, stats)?;
+        let r_ndv = self.expr_ndv(&be.right, graph, stats)?;
+        let denom = l_ndv.max(r_ndv);
+
+        if denom.is_finite() && denom > 0.0 {
+            // clamp into (0, 1]
+            let sel = (1.0 / denom).min(1.0).max(1e-12);
+            Some(sel)
+        } else {
+            None
+        }
+    }
+}
+
+/// Cost model that uses StatsProvider + ExpressionSelectivityEstimator, instead of
+/// requiring the caller to supply `predicate_selectivities`.
+///
+/// Cardinality model (computed on demand):
+///   card(S) = (∏ base_card(i) for i in S) * (∏ sel(p) for all p with rel_mask(p) ⊆ S)
+///
+/// Selectivity for each predicate is estimated via `estimator`, with defaults if unknown.
+pub struct StatsNdvCostModel<'a> {
+    pub stats: &'a dyn StatsProvider,
+    pub estimator: &'a dyn ExpressionSelectivityEstimator,
+    pub defaults: SelectivityDefaults,
+}
+
+impl<'a> StatsNdvCostModel<'a> {
+    fn base_card(&self, rel_id: usize, graph: &JoinGraph) -> f64 {
+        self.stats
+            .base_cardinality(rel_id, graph)
+            .unwrap_or(1.0)
+    }
+
+    fn predicate_sel(&self, pred: &Expr, graph: &JoinGraph) -> f64 {
+        // Try estimator; if it's an equality we can fallback to unknown_equality;
+        // else unknown_predicate.
+        if let Some(sel) = self.estimator.estimate_selectivity(pred, graph, self.stats) {
+            return sel;
+        }
+        match pred {
+            Expr::BinaryExpr(be) if be.op == Operator::Eq => self.defaults.unknown_equality,
+            _ => self.defaults.unknown_predicate,
+        }
+    }
+
+    fn subset_cardinality(&self, subset: BitSet, graph: &JoinGraph) -> f64 {
+        let mut card = 1.0_f64;
+
+        // base cards
+        let mut mask = subset;
+        while mask != 0 {
+            let i = mask.trailing_zeros() as usize;
+            mask ^= 1u64 << i;
+            card *= self.base_card(i, graph);
+        }
+
+        // predicate selectivities, once per subset (no double counting)
+        for pred in &graph.predicates {
+            let rel_mask = pred.rel_mask;
+            if rel_mask != 0 && (rel_mask & subset) == rel_mask {
+                card *= self.predicate_sel(&pred.expr, graph);
+            }
+        }
+
+        card
+    }
+}
+
+impl<'a> DPhypCostModel for StatsNdvCostModel<'a> {
+    fn base_cost_cardinality(
+        &self,
+        rel_id: usize,
+        graph: &JoinGraph,
+    ) -> (f64, f64) {
+        let card = self.base_card(rel_id, graph);
+        (card, card)
+    }
+
+    fn join_cost_cardinality(
+        &self,
+        left: &DPhypPlanEntry,
+        right: &DPhypPlanEntry,
+        graph: &JoinGraph,
+    ) -> (f64, f64) {
+        let subset = left.subset | right.subset;
+        let result_card = self.subset_cardinality(subset, graph);
+        let join_cost = result_card;
+        (join_cost, result_card)
+    }
+}
+
 
 /// Run DPhyp-based join order optimization recursively over a plan.
 ///
@@ -2633,5 +2829,134 @@ mod tests {
         );
     }
 
+
+    #[test]
+    fn ndv_selectivity_influences_three_way_chain_order() {
+        // Graph: A -- B -- C with two equality predicates:
+        //   p0: A.id1 = B.id1  => sel ~ 1 / max(NDV(A.id1), NDV(B.id1)) = 1e-4
+        //   p1: B.id2 = C.id2  => sel ~ 1 / max(NDV(B.id2), NDV(C.id2)) = 1e-2
+        //
+        // Base cards equal so only predicate selectivity drives the choice.
+        // Expected: join {A,B} first.
+
+        // Base relations A, B, C
+        let rel_a = JoinRelation {
+            id: 0,
+            name: "A".to_string(),
+            plan: dummy_scan("A"),
+            filters: vec![],
+        };
+        let rel_b = JoinRelation {
+            id: 1,
+            name: "B".to_string(),
+            plan: dummy_scan("B"),
+            filters: vec![],
+        };
+        let rel_c = JoinRelation {
+            id: 2,
+            name: "C".to_string(),
+            plan: dummy_scan("C"),
+            filters: vec![],
+        };
+
+        let relations = vec![rel_a, rel_b, rel_c];
+
+        let a_ref = TableReference::bare("A");
+        let b_ref = TableReference::bare("B");
+        let c_ref = TableReference::bare("C");
+
+        // Simple edges (not required for hyper connectivity here, but consistent with the rest)
+        let edges = vec![
+            JoinEdge {
+                left: 0,
+                right: 1,
+                on: vec![(col_ref(&a_ref, "id1"), col_ref(&b_ref, "id1"))],
+            },
+            JoinEdge {
+                left: 1,
+                right: 2,
+                on: vec![(col_ref(&b_ref, "id2"), col_ref(&c_ref, "id2"))],
+            },
+        ];
+
+        // Hypergraph predicates
+        let predicates = vec![
+            JoinPredicate {
+                rel_mask: (1u64 << 0) | (1u64 << 1),
+                expr: col_ref(&a_ref, "id1").eq(col_ref(&b_ref, "id1")),
+            },
+            JoinPredicate {
+                rel_mask: (1u64 << 1) | (1u64 << 2),
+                expr: col_ref(&b_ref, "id2").eq(col_ref(&c_ref, "id2")),
+            },
+        ];
+
+        let graph = JoinGraph {
+            relations,
+            edges,
+            predicates,
+        };
+
+        // Dummy StatsProvider for the test
+        struct TestStats {
+            base: HashMap<String, f64>,
+            ndv: HashMap<(String, String), f64>,
+        }
+
+        impl StatsProvider for TestStats {
+            fn base_cardinality(&self, rel_id: usize, graph: &JoinGraph) -> Option<f64> {
+                self.base.get(&graph.relations[rel_id].name).copied()
+            }
+
+            fn column_ndv(&self, col: &Column, _graph: &JoinGraph) -> Option<f64> {
+                let rel = col.relation.as_ref()?.to_string();
+                self.ndv.get(&(rel, col.name.clone())).copied()
+            }
+        }
+
+        let mut base = HashMap::new();
+        base.insert("A".to_string(), 1000.0);
+        base.insert("B".to_string(), 1000.0);
+        base.insert("C".to_string(), 1000.0);
+
+        let mut ndv = HashMap::new();
+        // A.id1 = B.id1 => max NDV = 1e4 => sel = 1e-4
+        ndv.insert(("A".to_string(), "id1".to_string()), 1e4);
+        ndv.insert(("B".to_string(), "id1".to_string()), 1e4);
+        // B.id2 = C.id2 => max NDV = 1e2 => sel = 1e-2
+        ndv.insert(("B".to_string(), "id2".to_string()), 1e2);
+        ndv.insert(("C".to_string(), "id2".to_string()), 1e2);
+
+        let stats = TestStats { base, ndv };
+
+        let estimator = NdvExpressionSelectivityEstimator {
+            defaults: SelectivityDefaults {
+                unknown_predicate: 0.25,
+                unknown_equality: 0.1,
+            },
+        };
+
+        let model = StatsNdvCostModel {
+            stats: &stats,
+            estimator: &estimator,
+            defaults: SelectivityDefaults::default(),
+        };
+
+        let result = dphyp_optimize_join_graph(&graph, &model).expect("expected DP result");
+        assert_eq!(result.full_subset, 0b111);
+
+        // Collect all 2-element subsets used as internal join nodes.
+        let mut pair_subsets = Vec::new();
+        collect_pair_subsets(&result, result.full_subset, &mut pair_subsets);
+
+        assert_eq!(pair_subsets.len(), 1);
+
+        let mask_ab: BitSet = (1u64 << 0) | (1u64 << 1);
+        assert_eq!(
+            pair_subsets[0], mask_ab,
+            "expected {{A,B}} to be the first join pair due to smaller NDV-based selectivity; got {:#b}",
+            pair_subsets[0]
+        );
+    }
 
 }
