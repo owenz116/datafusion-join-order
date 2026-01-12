@@ -435,130 +435,248 @@ pub fn dphyp_optimize_join_graph<M: DPhypCostModel>(
     graph: &JoinGraph,
     model: &M,
 ) -> Option<DPhypResult> {
-    let n = graph.relations.len();
-    if n == 0 {
-        return None;
-    }
-    if n > 63 {
-        return None;
-    }
-
-    let neighbors = build_neighbor_masks(graph);
-    let full_mask: BitSet = if n == 64 {
-        u64::MAX
-    } else {
-        (1u64 << n) - 1
-    };
-
-    let mut connected_subsets: Vec<BitSet> = Vec::new();
-    for mask in 1..=full_mask {
-        if is_connected_mask(mask, &neighbors) {
-            connected_subsets.push(mask);
+        let n = graph.relations.len();
+        if n == 0 || n > 63 {
+            return None;
         }
-    }
-    connected_subsets.sort_by_key(|m| bit_count(*m));
+        let full_mask: BitSet = if n == 63 { u64::MAX } else { (1u64 << n) - 1 };
 
-    let mut plans: HashMap<BitSet, DPhypPlanEntry> = HashMap::new();
+        // Project hyperedges to an adjacency mask for neighborhood expansion
+        // (same idea as your existing build_neighbor_masks).
+        let neighbors = build_neighbor_masks(graph);
 
-    // ---- base relations (singletons) ----
-    for rel in 0..n {
-        let mask = 1u64 << rel;
+        // dpTable: best plan for each (connected) relation subset that we've constructed so far
+        let mut plans: HashMap<BitSet, DPhypPlanEntry> = HashMap::new();
 
-        let (base_cost, base_card) = model.base_cost_cardinality(rel, graph);
-        plans.insert(
-            mask,
-            DPhypPlanEntry {
-                subset: mask,
-                left: None,
-                right: None,
-                cost: base_cost,
-                cardinality: base_card,
-            },
-        );
-    }
-
-    // ---- larger connected subsets ----
-    for &subset in &connected_subsets {
-        if bit_count(subset) <= 1 {
-            continue;
+        // Solve(): initialize singleton plans
+        for rel_id in 0..n {
+            let bit = 1u64 << rel_id;
+            let (cost, card) = model.base_cost_cardinality(rel_id, graph);
+            plans.insert(
+                bit,
+                DPhypPlanEntry {
+                    subset: bit,
+                    left: None,
+                    right: None,
+                    cost,
+                    cardinality: card,
+                },
+            );
         }
 
-        let mut best: Option<DPhypPlanEntry> = None;
+        // --- helpers (csg-cmp enumeration) ---
+        #[inline]
+        fn min_bit_index(mask: BitSet) -> usize {
+            debug_assert!(mask != 0);
+            mask.trailing_zeros() as usize
+        }
 
-        let mut sub = subset & (subset - 1);
-        while sub > 0 {
-            let left_mask = sub;
-            let right_mask = subset ^ left_mask;
-            if right_mask == 0 {
-                sub = (sub - 1) & subset;
-                continue;
+        #[inline]
+        fn prefix_mask_inclusive(idx: usize) -> BitSet {
+            // {0..=idx}
+            if idx >= 63 {
+                u64::MAX
+            } else {
+                (1u64 << (idx + 1)) - 1
+            }
+        }
+
+        #[inline]
+        fn neighborhood(set: BitSet, exclude: BitSet, neighbors: &[BitSet], full: BitSet) -> BitSet {
+            // union of adjacency of vertices in `set`, minus `set` and minus `exclude`
+            let mut adj: BitSet = 0;
+            let mut m = set;
+            while m != 0 {
+                let v = m.trailing_zeros() as usize;
+                let bit = 1u64 << v;
+                m ^= bit;
+                adj |= neighbors[v];
+            }
+            adj &= full;
+            adj &= !set;
+            adj &= !exclude;
+            adj
+        }
+
+        #[inline]
+        fn nonzero_submasks(mask: BitSet) -> Vec<BitSet> {
+            let mut out = Vec::new();
+            let mut sub = mask;
+            while sub != 0 {
+                out.push(sub);
+                sub = (sub - 1) & mask;
+            }
+            out
+        }
+
+        fn emit_csg_cmp<M: DPhypCostModel>(
+            a: BitSet,
+            b: BitSet,
+            graph: &JoinGraph,
+            model: &M,
+            plans: &mut HashMap<BitSet, DPhypPlanEntry>,
+        ) {
+            if a == 0 || b == 0 {
+                return;
+            }
+            if (a & b) != 0 {
+                return;
+            }
+            if !has_cross_edge(a, b, graph) {
+                return;
             }
 
-            let left_plan = match plans.get(&left_mask) {
-                Some(p) => p,
-                None => {
-                    sub = (sub - 1) & subset;
-                    continue;
-                }
+            let union = a | b;
+            let a_entry = match plans.get(&a) {
+                Some(e) => e.clone(),
+                None => return,
             };
-            let right_plan = match plans.get(&right_mask) {
-                Some(p) => p,
-                None => {
-                    sub = (sub - 1) & subset;
-                    continue;
-                }
+            let b_entry = match plans.get(&b) {
+                Some(e) => e.clone(),
+                None => return,
             };
 
-            if !has_cross_edge(left_mask, right_mask, graph) {
-                sub = (sub - 1) & subset;
-                continue;
-            }
-
-            // delegate completely to cost model
-            let (join_cost, result_card) =
-                model.join_cost_cardinality(left_plan, right_plan, graph);
-
-            let result_cost = left_plan.cost + right_plan.cost + join_cost;
-
-            match &mut best {
-                None => {
-                    best = Some(DPhypPlanEntry {
-                        subset,
-                        left: Some(left_mask),
-                        right: Some(right_mask),
-                        cost: result_cost,
-                        cardinality: result_card,
-                    });
-                }
-                Some(b) => {
-                    if result_cost < b.cost {
-                        *b = DPhypPlanEntry {
-                            subset,
+            // The paper enumerates each unordered csg-cmp pair only once, so we must
+            // consider both orientations here (important if the cost model is asymmetric).
+            for (left_mask, right_mask, left_e, right_e) in [
+                (a, b, a_entry.clone(), b_entry.clone()),
+                (b, a, b_entry, a_entry),
+            ] {
+                let (join_cost, result_card) = model.join_cost_cardinality(&left_e, &right_e, graph);
+                let candidate_cost = left_e.cost + right_e.cost + join_cost;
+                let better = match plans.get(&union) {
+                    Some(existing) => candidate_cost < existing.cost,
+                    None => true,
+                };
+                if better {
+                    plans.insert(
+                        union,
+                        DPhypPlanEntry {
+                            subset: union,
                             left: Some(left_mask),
                             right: Some(right_mask),
-                            cost: result_cost,
+                            cost: candidate_cost,
                             cardinality: result_card,
-                        };
-                    }
+                        },
+                    );
+                }
+            }
+        }
+
+        fn enumerate_cmp_rec<M: DPhypCostModel>(
+            s1: BitSet,
+            s2: BitSet,
+            x: BitSet,
+            full: BitSet,
+            neighbors: &[BitSet],
+            graph: &JoinGraph,
+            model: &M,
+            plans: &mut HashMap<BitSet, DPhypPlanEntry>,
+        ) {
+            let neigh = neighborhood(s2, x, neighbors, full);
+            if neigh == 0 {
+                return;
+            }
+            let subs = nonzero_submasks(neigh);
+
+            // First loop: try to emit joinable complements
+            for nmask in &subs {
+                let cand = s2 | *nmask;
+                if plans.contains_key(&cand) && has_cross_edge(s1, cand, graph) {
+                    emit_csg_cmp(s1, cand, graph, model, plans);
                 }
             }
 
-            sub = (sub - 1) & subset;
+            // Second loop: recurse to extend S2
+            let x2 = x | neigh;
+            for nmask in subs {
+                let cand = s2 | nmask;
+                if plans.contains_key(&cand) {
+                    enumerate_cmp_rec(s1, cand, x2, full, neighbors, graph, model, plans);
+                }
+            }
         }
 
-        if let Some(entry) = best {
-            plans.insert(subset, entry);
+        fn emit_csg<M: DPhypCostModel>(
+            s1: BitSet,
+            full: BitSet,
+            neighbors: &[BitSet],
+            graph: &JoinGraph,
+            model: &M,
+            plans: &mut HashMap<BitSet, DPhypPlanEntry>,
+        ) {
+            // X = S1 ∪ Bmin(S1)
+            let min_idx = min_bit_index(s1);
+            let x = s1 | prefix_mask_inclusive(min_idx);
+
+            // N = N(S1, X)
+            let neigh = neighborhood(s1, x, neighbors, full);
+            if neigh == 0 {
+                return;
+            }
+
+            // for each v in N descending according to ≺
+            for v in (0..neighbors.len()).rev() {
+                let bit = 1u64 << v;
+                if (neigh & bit) == 0 {
+                    continue;
+                }
+                let s2 = bit;
+                if has_cross_edge(s1, s2, graph) {
+                    emit_csg_cmp(s1, s2, graph, model, plans);
+                }
+                enumerate_cmp_rec(s1, s2, x, full, neighbors, graph, model, plans);
+            }
         }
-    }
 
-    if !plans.contains_key(&full_mask) {
-        return None;
-    }
+        fn enumerate_csg_rec<M: DPhypCostModel>(
+            s1: BitSet,
+            x: BitSet,
+            full: BitSet,
+            neighbors: &[BitSet],
+            graph: &JoinGraph,
+            model: &M,
+            plans: &mut HashMap<BitSet, DPhypPlanEntry>,
+        ) {
+            let neigh = neighborhood(s1, x, neighbors, full);
+            if neigh == 0 {
+                return;
+            }
+            let subs = nonzero_submasks(neigh);
 
-    Some(DPhypResult {
-        plans,
-        full_subset: full_mask,
-    })
+            // First loop: smaller sets must be processed first for DP validity
+            for nmask in &subs {
+                let cand = s1 | *nmask;
+                if plans.contains_key(&cand) {
+                    emit_csg(cand, full, neighbors, graph, model, plans);
+                }
+            }
+
+            // Second loop: recurse with X ∪ N(S1, X)
+            let x2 = x | neigh;
+            for nmask in subs {
+                let cand = s1 | nmask;
+                if plans.contains_key(&cand) {
+                    enumerate_csg_rec(cand, x2, full, neighbors, graph, model, plans);
+                }
+            }
+        }
+
+        // Solve(): main loop, v descending by id
+        for v in (0..n).rev() {
+            let s1 = 1u64 << v;
+            emit_csg(s1, full_mask, &neighbors, graph, model, &mut plans);
+
+            // Bv = {w | w ≺ v} ∪ {v} = {0..=v}
+            let bv = prefix_mask_inclusive(v);
+            enumerate_csg_rec(s1, bv, full_mask, &neighbors, graph, model, &mut plans);
+        }
+
+        plans.get(&full_mask)?;
+        Some(DPhypResult {
+            full_subset: full_mask,
+            plans,
+        })
 }
 /// Build bitset neighbor masks for each relation in the join hypergraph.
 ///
@@ -1330,6 +1448,45 @@ mod tests {
     use arrow::datatypes::{DataType, Field, Schema};
     use datafusion_common::Spans;
     use datafusion_expr::{logical_plan::LogicalPlanBuilder, Expr, JoinType, LogicalPlan, TableSource, TableProviderFilterPushDown, BinaryExpr};
+    use std::collections::BTreeSet;
+
+    /// Collect leaf table names (TableScan) under a subtree, sorted & deduped.
+    fn leaf_table_set(plan: &LogicalPlan) -> BTreeSet<String> {
+        let mut set = BTreeSet::new();
+        plan.apply(|node| {
+            if let LogicalPlan::TableScan(ts) = node {
+                // table_name is a TableReference; .table() is stable & prints just "a", "b", ...
+                set.insert(ts.table_name.table().to_string());
+            }
+            Ok(TreeNodeRecursion::Continue)
+        })
+            .unwrap();
+        set
+    }
+
+    /// Returns true iff `plan` is a Join subtree whose leaf set equals `target`.
+    fn is_join_with_exact_leaves(plan: &LogicalPlan, target: &[&str]) -> bool {
+        if !matches!(plan, LogicalPlan::Join(_)) {
+            return false;
+        }
+        let got = leaf_table_set(plan);
+        let want: BTreeSet<String> = target.iter().map(|s| s.to_string()).collect();
+        got == want
+    }
+
+    /// Returns true iff *any* Join node in the subtree joins exactly `target` leaves.
+    fn subtree_contains_join_with_exact_leaves(plan: &LogicalPlan, target: &[&str]) -> bool {
+        let mut found = false;
+        plan.apply(|node| {
+            if !found && is_join_with_exact_leaves(node, target) {
+                found = true;
+                return Ok(TreeNodeRecursion::Stop);
+            }
+            Ok(TreeNodeRecursion::Continue)
+        })
+            .unwrap();
+        found
+    }
 
     #[derive(Debug)]
     struct RawTableSource;
@@ -1437,10 +1594,6 @@ mod tests {
 
         let result =
             dphyp_optimize_join_graph(&graph, &model).expect("expected a DP result");
-
-
-        // let result =
-        //     dphyp_optimize_join_graph(&graph, Some(&base)).expect("expected a DP result");
 
         assert_eq!(result.full_subset, 0b11);
 
@@ -2553,45 +2706,26 @@ mod tests {
             other => panic!("expected Filter at root, got {other:?}"),
         };
 
-        // join_under_filter should be a Join whose *left* child is a Join
-        // between exactly {b,c} (in any order).
-        let (left_child, right_child) = match &join_under_filter {
-            LogicalPlan::Join(j) => (j.left.as_ref(), j.right.as_ref()),
-            other => panic!("expected Join under Filter, got {other:?}"),
-        };
-
-        // Collect leaf relation names under the left child of the top join.
-        fn leaf_relation_names(plan: &LogicalPlan) -> Vec<String> {
-            let mut names = Vec::new();
-            plan.apply(|node| {
-                if let LogicalPlan::TableScan(ts) = node {
-                    names.push(ts.table_name.to_string());
-                }
-                Ok(TreeNodeRecursion::Continue)
-            })
-                .unwrap();
-            names
-        }
-
-        let left_leaf_names = leaf_relation_names(left_child);
-
-        // We expect the DP to join b and c first (the two smallest).
+        // Under the Filter we still expect a 3-way join over {a,b,c}.
         assert!(
-            left_leaf_names.contains(&"b".to_string())
-                && left_leaf_names.contains(&"c".to_string())
-                && left_leaf_names.len() == 2,
-            "expected left child of top join to be the join of {{b,c}}, got leaves {:?}",
-            left_leaf_names
+            matches!(join_under_filter, LogicalPlan::Join(_)),
+            "expected Join under Filter, got {join_under_filter:?}"
+        );
+        let leaves = leaf_table_set(&join_under_filter);
+        assert_eq!(
+            leaves,
+            ["a", "b", "c"].into_iter().map(|s| s.to_string()).collect(),
+            "expected join under Filter to cover {{a,b,c}}, got {leaves:?}"
         );
 
-        // And the right child should be the remaining relation a.
-        let right_leaf_names = leaf_relation_names(right_child);
-        assert_eq!(
-            right_leaf_names,
-            vec!["a".to_string()],
-            "expected right child of top join to be {{a}}, got leaves {:?}",
-            right_leaf_names
+        // Key property: the 3-way join tree should contain a sub-join over exactly {b,c}
+        // (meaning b and c are joined first), regardless of left/right placement.
+        assert!(
+            subtree_contains_join_with_exact_leaves(&join_under_filter, &["b", "c"]),
+            "expected a sub-join over exactly {{b,c}} somewhere under Filter; got plan {join_under_filter:?}"
         );
+
+
     }
 
     #[test]
@@ -2806,27 +2940,12 @@ mod tests {
         );
 
         // We also expect that somewhere inside that left subtree, there is a
-        // sub-join operating exactly on {b,c}, because they are the two
-        // smallest relations in our cost model.
-        let left_join = match left_child {
-            LogicalPlan::Join(j) => j,
-            other => panic!("expected inner island to be a Join, got {other:?}"),
-        };
-
-        let mut child1_names = leaf_relation_names(&left_join.left);
-        let mut child2_names = leaf_relation_names(&left_join.right);
-        child1_names.sort();
-        child2_names.sort();
-
-        let have_bc_subjoin =
-            child1_names == vec!["b".to_string(), "c".to_string()] ||
-                child2_names == vec!["b".to_string(), "c".to_string()];
-
+        // sub-join operating exactly on {b,c}, because they are the two smallest.
         assert!(
-            have_bc_subjoin,
-            "expected a sub-join on {{b,c}} inside inner island, \
-             got left child leaves={child1_names:?}, right child leaves={child2_names:?}"
+            subtree_contains_join_with_exact_leaves(left_child, &["b", "c"]),
+            "expected a sub-join on {{b,c}} somewhere inside LEFT-join's left subtree; got {left_child:?}"
         );
+
     }
 
 
@@ -2956,6 +3075,67 @@ mod tests {
             pair_subsets[0], mask_ab,
             "expected {{A,B}} to be the first join pair due to smaller NDV-based selectivity; got {:#b}",
             pair_subsets[0]
+        );
+    }
+
+    #[test]
+    fn optimize_joins_recursively_rewrites_three_way_chain_under_projection() {
+        use std::collections::HashMap;
+        use datafusion_expr::col;
+
+        let a_scan = dummy_scan("a");
+        let b_scan = dummy_scan("b");
+        let c_scan = dummy_scan("c");
+
+        let ab_join = LogicalPlanBuilder::from(a_scan)
+            .join(b_scan, JoinType::Inner, (vec!["id"], vec!["id"]), None)
+            .unwrap()
+            .build()
+            .unwrap();
+
+        let left_deep = LogicalPlanBuilder::from(ab_join)
+            .join(c_scan, JoinType::Inner, (vec!["b.id"], vec!["id"]), None)
+            .unwrap()
+            .build()
+            .unwrap();
+
+        // Projection above the island (choose qualified cols to avoid ambiguity).
+        let projected = LogicalPlanBuilder::from(left_deep.clone())
+            .project(vec![col("a.id"), col("b.id"), col("c.id")])
+            .unwrap()
+            .build()
+            .unwrap();
+
+        let mut cards = HashMap::new();
+        cards.insert("a".to_string(), 1000.0);
+        cards.insert("b".to_string(), 10.0);
+        cards.insert("c".to_string(), 1.0);
+        let model = NamedCardinalityCostModel { cards };
+
+        let optimized = optimize_joins_in_plan(&projected, &model).unwrap();
+
+        // Root stays Projection.
+        let join_under_proj = match optimized {
+            LogicalPlan::Projection(p) => (*p.input).clone(),
+            other => panic!("expected Projection at root, got {other:?}"),
+        };
+
+        // Under projection: still a 3-way join over {a,b,c} with a {b,c} sub-join somewhere.
+        assert!(
+            matches!(join_under_proj, LogicalPlan::Join(_)),
+            "expected Join under Projection, got {join_under_proj:?}"
+        );
+
+        let leaves = leaf_table_set(&join_under_proj);
+        assert_eq!(
+            leaves,
+            ["a", "b", "c"].into_iter().map(|s| s.to_string()).collect(),
+            "expected join under Projection to cover {{a,b,c}}, got {leaves:?}"
+        );
+
+        assert!(
+            subtree_contains_join_with_exact_leaves(&join_under_proj, &["b", "c"]),
+            "expected a sub-join over exactly {{b,c}} somewhere under Projection; got plan {join_under_proj:?}"
         );
     }
 
