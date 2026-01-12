@@ -10,27 +10,27 @@ use datafusion_expr::{Expr, JoinConstraint, JoinType, Operator};
 use datafusion_expr::utils::{conjunction, split_conjunction};
 
 
-
+/// Bitset encoding a set of relations.
+///
+/// # Invariant (JoinGraph):
+/// Relation ids are *stable indices* into `JoinGraph.relations`, and those same indices
+/// are the bit positions used everywhere (`BitSet = u64`).
+///
+/// Concretely, for relation `i`, the corresponding bit is `1u64 << i`.
+/// This implies `graph.relations.len() <= 63` in all DP code paths that shift bits.
 type BitSet = u64;
 
-
 /// A base relation participating in a join island.
-///
-/// For Commit 1 we treat *any* leaf logical plan (typically
-/// `TableScan` or `SubqueryAlias`) as an atom.
 #[derive(Debug, Clone)]
 pub struct JoinRelation {
     /// Stable index of this relation in the `JoinGraph.relations` vector.
+    ///
+    /// # Invariant:
+    /// `relations[i].id == i` for all relations in a valid JoinGraph.
     pub id: usize,
-    /// A human-readable identifier (typically table or alias name).
     pub name: String,
     /// The full logical subplan for this relation (TableScan, SubqueryAlias, etc.).
-    pub plan: LogicalPlan,
-    /// Local predicates that can be pushed down to this relation.
-    ///
-    /// For Commit 1 this will be empty; we’ll populate it later when we
-    /// start pulling apart Filters.
-    pub filters: Vec<Expr>,
+    pub plan: LogicalPlan
 }
 
 /// A join predicate hyperedge over one or more relations.
@@ -38,7 +38,7 @@ pub struct JoinRelation {
 /// In the Moerkotte/Neumann terminology, this is the query hypergraph
 /// edge: all relations whose columns appear in the equality predicate.
 #[derive(Debug, Clone)]
-pub struct JoinPredicate {
+pub struct HyperPredicate {
     /// Bitset of relations (indices into `JoinGraph.relations`) that
     /// this predicate references.
     pub rel_mask: BitSet,
@@ -49,12 +49,13 @@ pub struct JoinPredicate {
 }
 
 
-/// A binary equi-join edge between two relations in the join graph.
+/// Reconstruction-only binary equi-join constraints.
 ///
-/// Moerkotte/Neumann generalize this to hyperedges and arbitrary
-/// predicates; right now we restrict to `col = col` pairs.
+/// These exist so that when we pick a DP split (L,R), we can recover
+/// concrete hash-join keys if such keys exist across the cut.
+/// DPhyp itself should NOT depend on this list for connectivity.
 #[derive(Debug, Clone)]
-pub struct JoinEdge {
+pub struct BinaryEquiConstraint {
     /// Index into `JoinGraph.relations`
     pub left: usize,
     /// Index into `JoinGraph.relations`
@@ -69,22 +70,26 @@ pub struct JoinEdge {
 pub struct JoinGraph {
     pub relations: Vec<JoinRelation>,
     /// Pairwise edges used mainly for “classic” 2-way equijoins.
-    pub edges: Vec<JoinEdge>,
+    pub binary_constraints: Vec<BinaryEquiConstraint>,
     /// Hyperedges over arbitrary sets of relations, one per equality
     /// predicate in the logical join tree.
-    pub predicates: Vec<JoinPredicate>,
+    pub hyper_predicates: Vec<HyperPredicate>,
 }
 
 
 /// High-level entry point: given a logical plan node that is either
-/// - a single INNER equi-join, possibly nested, or
+/// - a single INNER ... ON join tree (possibly nested), or
 /// - a leaf (no joins),
 /// try to extract a JoinGraph.
 ///
+/// # Important invariant / requirement
+/// This optimizer currently **requires qualified column references** in join expressions
+/// (e.g. `a.id` not `id`) so that we can map `Expr` -> base relation ids via `TableReference`.
+/// If join expressions contain unqualified columns, extraction returns an error.
+///
 /// Returns:
 /// - Ok(Some(graph)) for a reorderable join island
-/// - Ok(None) if the plan is *not* a pure inner equi-join island
-///   (outer joins, non-equi filters, etc.)
+/// - Ok(None) if the plan is *not* a pure inner join island (outer joins etc.)
 pub fn extract_join_graph(root: &LogicalPlan) -> DFResult<Option<JoinGraph>> {
     let mut builder = GraphBuilder::default();
     if !builder.walk(root)? {
@@ -93,29 +98,79 @@ pub fn extract_join_graph(root: &LogicalPlan) -> DFResult<Option<JoinGraph>> {
 
     let graph = JoinGraph {
         relations: builder.relations,
-        edges: builder.edges,
-        predicates: builder.predicates,
+        binary_constraints: builder.binary_constraints,
+        hyper_predicates: builder.hyper_predicates,
     };
-    
-    if graph.relations.len() >= 2 && (!graph.edges.is_empty() || !graph.predicates.is_empty()) {
+
+    // ---------------------------
+    // JoinGraph invariants (debug)
+    // ---------------------------
+    //
+    // 1) Relation ids are stable indices and match bit positions used everywhere:
+    //      relations[i].id == i  and  bit(i) == 1u64 << i
+    //
+    // 2) Every JoinPredicate.rel_mask refers only to valid relation indices:
+    //      (pred.rel_mask >> relations.len()) == 0
+    //
+    // 3) For binary edges:
+    //      - left != right
+    //      - endpoints in range
+    //      - edge.on holds only "equi pairs" of Expr::Column = Expr::Column
+    #[cfg(debug_assertions)]
+    {
+        let n = graph.relations.len();
+
+        for (i, rel) in graph.relations.iter().enumerate() {
+            debug_assert_eq!(
+                rel.id, i,
+                "JoinGraph invariant violated: relations[{}].id = {}, expected {}",
+                i, rel.id, i
+            );
+        }
+
+        for pred in &graph.hyper_predicates {
+            debug_assert!(
+                pred.rel_mask != 0,
+                "JoinGraph invariant violated: predicate rel_mask must be non-zero"
+            );
+            debug_assert!(
+                (pred.rel_mask >> n) == 0,
+                "JoinGraph invariant violated: predicate rel_mask has out-of-range bits: mask={:b}, n={}",
+                pred.rel_mask, n
+            );
+        }
+
+        for edge in &graph.binary_constraints {
+            debug_assert!(edge.left < n && edge.right < n, "JoinEdge endpoint out of range");
+            debug_assert_ne!(edge.left, edge.right, "JoinEdge invariant violated: left == right");
+            debug_assert!(!edge.on.is_empty(), "JoinEdge invariant violated: empty edge.on");
+            for (l, r) in &edge.on {
+                debug_assert!(
+                    matches!(l, Expr::Column(_)) && matches!(r, Expr::Column(_)),
+                    "JoinEdge invariant violated: JoinEdge::on must store Column=Column pairs; \
+                     complex equalities must be represented as JoinPredicate hyperedges"
+                );
+            }
+        }
+    }
+
+    if graph.relations.len() >= 2 && (!graph.binary_constraints.is_empty() || !graph.hyper_predicates.is_empty()) {
         Ok(Some(graph))
     } else {
         Ok(None)
     }
-
 }
+
 
 
 #[derive(Default)]
 struct GraphBuilder {
     relations: Vec<JoinRelation>,
-    edges: Vec<JoinEdge>,
+    binary_constraints: Vec<BinaryEquiConstraint>,
     /// All join predicates as hyperedges.
-    predicates: Vec<JoinPredicate>,
+    hyper_predicates: Vec<HyperPredicate>,
     /// Map from relation (table / alias) to `relations` index.
-    name_to_id: HashMap<TableReference, usize>,
-    /// Did we see only “safe” inner equi-joins?
-    ok: bool,
+    name_to_id: HashMap<TableReference, usize>
 }
 
 impl GraphBuilder {
@@ -170,15 +225,20 @@ impl GraphBuilder {
     /// Add (or extend) a simple 2-way JoinEdge between `left` and `right`
     /// for a single ON pair (l_expr, r_expr).
     fn add_binary_edge(&mut self, left: usize, right: usize, l_expr: Expr, r_expr: Expr) {
+        debug_assert_ne!(left, right, "JoinEdge invariant violated: left == right");
+        debug_assert!(
+            matches!(l_expr, Expr::Column(_)) && matches!(r_expr, Expr::Column(_)),
+            "JoinEdge invariant violated: only store Column=Column pairs in JoinEdge; use JoinPredicate otherwise"
+        );
         let (a, b) = if left <= right { (left, right) } else { (right, left) };
         if let Some(edge) = self
-            .edges
+            .binary_constraints
             .iter_mut()
             .find(|e| (e.left == a && e.right == b) || (e.left == b && e.right == a))
         {
             edge.on.push((l_expr, r_expr));
         } else {
-            self.edges.push(JoinEdge {
+            self.binary_constraints.push(BinaryEquiConstraint {
                 left: a,
                 right: b,
                 on: vec![(l_expr, r_expr)],
@@ -195,7 +255,6 @@ impl GraphBuilder {
             other => {
                 if contains_join(other)? {
                     // We don’t (yet) support islands with subqueries containing joins.
-                    self.ok = false;
                     Ok(false)
                 } else {
                     self.add_base_relation(other);
@@ -207,7 +266,6 @@ impl GraphBuilder {
 
     fn handle_join(&mut self, join: &Join) -> DFResult<bool> {
         if !is_reorderable_inner_equi_join(join) {
-            self.ok = false;
             return Ok(false);
         }
 
@@ -215,7 +273,6 @@ impl GraphBuilder {
         let left_ok = self.walk(&join.left)?;
         let right_ok = self.walk(&join.right)?;
         if !left_ok || !right_ok {
-            self.ok = false;
             return Ok(false);
         }
 
@@ -231,7 +288,6 @@ impl GraphBuilder {
                 match self.rel_mask_and_single_id_for_expr(l_expr) {
                     Ok(v) => v,
                     Err(_) => {
-                        self.ok = false;
                         return Ok(false);
                     }
                 };
@@ -239,7 +295,6 @@ impl GraphBuilder {
                 match self.rel_mask_and_single_id_for_expr(r_expr) {
                     Ok(v) => v,
                     Err(_) => {
-                        self.ok = false;
                         return Ok(false);
                     }
                 };
@@ -247,12 +302,11 @@ impl GraphBuilder {
             let rel_mask = left_mask | right_mask;
             if rel_mask == 0 {
                 // Should not happen for a valid equi-join, but be defensive.
-                self.ok = false;
                 return Ok(false);
             }
 
             // Record hyperedge for the full equality.
-            self.predicates.push(JoinPredicate {
+            self.hyper_predicates.push(HyperPredicate {
                 rel_mask,
                 expr: l_expr.clone().eq(r_expr.clone()),
             });
@@ -261,14 +315,15 @@ impl GraphBuilder {
             // relation, and they are different), keep a binary edge as well.
             if let (Some(l_id), Some(r_id)) = (left_single, right_single) {
                 if l_id != r_id {
-                    self.add_binary_edge(l_id, r_id, l_expr.clone(), r_expr.clone());
+                    // Binary edges are only for classic Column=Column equijoins.
+                    // Anything more complex (even if it touches exactly two relations)
+                    // should stay as a hyperedge predicate.
+                    if matches!(l_expr, Expr::Column(_)) && matches!(r_expr, Expr::Column(_)) {
+                        self.add_binary_edge(l_id, r_id, l_expr.clone(), r_expr.clone());
+                    }
                 } else {
-                    // Equality within the same relation (e.g. self-join key),
-                    // not useful as a join edge here.
+                    // ...
                 }
-            } else {
-                // True hyperedge like a.x + b.y = c.z + d.w: we only keep it
-                // in `predicates` (hypergraph), no simple JoinEdge.
             }
         }
 
@@ -282,7 +337,6 @@ impl GraphBuilder {
                         Err(_) => {
                             // If we can't map the expression cleanly to our relation ids,
                             // bail out for now: this join tree is not (yet) reorderable.
-                            self.ok = false;
                             return Ok(false);
                         }
                     };
@@ -296,7 +350,7 @@ impl GraphBuilder {
                 // Record a hyperedge for this filter predicate. Unlike ON pairs,
                 // we don't try to synthesize a binary JoinEdge: this might be a
                 // three- or four-way predicate.
-                self.predicates.push(JoinPredicate {
+                self.hyper_predicates.push(HyperPredicate {
                     rel_mask,
                     expr: conjunct.clone(),
                 });
@@ -323,7 +377,6 @@ impl GraphBuilder {
             id,
             name: display_name,
             plan: plan.clone(),
-            filters: Vec::new(),
         });
     }
 
@@ -417,6 +470,229 @@ pub struct DPhypResult {
     pub full_subset: BitSet,
 }
 
+/// DPhyp CSG/CMP enumerator (Moerkotte/Neumann).
+///
+/// Holds all shared state so the algorithm matches the paper structure
+/// and avoids threading many parameters through nested functions.
+struct DphypEnumerator<'a, M: DPhypCostModel> {
+    graph: &'a JoinGraph,
+    model: &'a M,
+    neighbors: &'a [BitSet],
+    full_mask: BitSet,
+    plans: &'a mut HashMap<BitSet, DPhypPlanEntry>,
+}
+
+impl<'a, M: DPhypCostModel> DphypEnumerator<'a, M> {
+    #[inline]
+    fn new(
+        graph: &'a JoinGraph,
+        model: &'a M,
+        neighbors: &'a [BitSet],
+        full_mask: BitSet,
+        plans: &'a mut HashMap<BitSet, DPhypPlanEntry>,
+    ) -> Self {
+        Self {
+            graph,
+            model,
+            neighbors,
+            full_mask,
+            plans,
+        }
+    }
+
+    #[inline]
+    fn min_bit_index(mask: BitSet) -> usize {
+        debug_assert!(mask != 0);
+        mask.trailing_zeros() as usize
+    }
+
+    #[inline]
+    fn prefix_mask_inclusive(idx: usize) -> BitSet {
+        // {0..=idx}
+        if idx >= 63 {
+            u64::MAX
+        } else {
+            (1u64 << (idx + 1)) - 1
+        }
+    }
+
+    #[inline]
+    fn neighborhood(&self, set: BitSet, exclude: BitSet) -> BitSet {
+        // union of adjacency of vertices in `set`, minus `set` and minus `exclude`
+        let mut adj: BitSet = 0;
+        let mut m = set;
+        while m != 0 {
+            let v = m.trailing_zeros() as usize;
+            let bit = 1u64 << v;
+            m ^= bit;
+            adj |= self.neighbors[v];
+        }
+        adj &= self.full_mask;
+        adj &= !set;
+        adj &= !exclude;
+        adj
+    }
+
+    fn emit_csg_cmp(&mut self, a: BitSet, b: BitSet) {
+        if a == 0 || b == 0 || (a & b) != 0 {
+            return;
+        }
+        if !has_cross_hyper_predicate(a, b, self.graph) {
+            return;
+        }
+
+        let union = a | b;
+
+        // ---- key change: clone to avoid holding immutable borrows across insert() ----
+        let a_entry = match self.plans.get(&a).cloned() {
+            Some(e) => e,
+            None => return,
+        };
+        let b_entry = match self.plans.get(&b).cloned() {
+            Some(e) => e,
+            None => return,
+        };
+
+        // Try both orientations (important if model is asymmetric)
+        // 1) a ⋈ b
+        {
+            let (join_cost, result_card) =
+                self.model.join_cost_cardinality(&a_entry, &b_entry, self.graph);
+            let candidate_cost = a_entry.cost + b_entry.cost + join_cost;
+
+            let existing_cost = self.plans.get(&union).map(|e| e.cost);
+            if existing_cost.map_or(true, |c| candidate_cost < c) {
+                self.plans.insert(
+                    union,
+                    DPhypPlanEntry {
+                        subset: union,
+                        left: Some(a),
+                        right: Some(b),
+                        cost: candidate_cost,
+                        cardinality: result_card,
+                    },
+                );
+            }
+        }
+
+        // 2) b ⋈ a
+        {
+            let (join_cost, result_card) =
+                self.model.join_cost_cardinality(&b_entry, &a_entry, self.graph);
+            let candidate_cost = b_entry.cost + a_entry.cost + join_cost;
+
+            let existing_cost = self.plans.get(&union).map(|e| e.cost);
+            if existing_cost.map_or(true, |c| candidate_cost < c) {
+                self.plans.insert(
+                    union,
+                    DPhypPlanEntry {
+                        subset: union,
+                        left: Some(b),
+                        right: Some(a),
+                        cost: candidate_cost,
+                        cardinality: result_card,
+                    },
+                );
+            }
+        }
+    }
+
+
+    fn enumerate_cmp_rec(&mut self, s1: BitSet, s2: BitSet, x: BitSet) {
+        let neigh = self.neighborhood(s2, x);
+        if neigh == 0 {
+            return;
+        }
+
+        // First loop: try to emit joinable complements
+        let mut nmask = neigh;
+        while nmask != 0 {
+            let cand = s2 | nmask;
+            if self.plans.contains_key(&cand) && has_cross_hyper_predicate(s1, cand, self.graph) {
+                self.emit_csg_cmp(s1, cand);
+            }
+            nmask = (nmask - 1) & neigh;
+        }
+
+        // Second loop: recurse to extend S2
+        let x2 = x | neigh;
+        let mut nmask = neigh;
+        while nmask != 0 {
+            let cand = s2 | nmask;
+            if self.plans.contains_key(&cand) {
+                self.enumerate_cmp_rec(s1, cand, x2);
+            }
+            nmask = (nmask - 1) & neigh;
+        }
+    }
+
+    fn emit_csg(&mut self, s1: BitSet) {
+        // X = S1 ∪ Bmin(S1)
+        let min_idx = Self::min_bit_index(s1);
+        let x = s1 | Self::prefix_mask_inclusive(min_idx);
+
+        // N = N(S1, X)
+        let neigh = self.neighborhood(s1, x);
+        if neigh == 0 {
+            return;
+        }
+
+        // for each v in N descending according to ≺
+        for v in (0..self.neighbors.len()).rev() {
+            let bit = 1u64 << v;
+            if (neigh & bit) == 0 {
+                continue;
+            }
+            let s2 = bit;
+            if has_cross_hyper_predicate(s1, s2, self.graph) {
+                self.emit_csg_cmp(s1, s2);
+            }
+            self.enumerate_cmp_rec(s1, s2, x);
+        }
+    }
+
+    fn enumerate_csg_rec(&mut self, s1: BitSet, x: BitSet) {
+        let neigh = self.neighborhood(s1, x);
+        if neigh == 0 {
+            return;
+        }
+
+        // First loop: emit_csg for supersets (no heap allocation)
+        let mut nmask = neigh;
+        while nmask != 0 {
+            let cand = s1 | nmask;
+            if self.plans.contains_key(&cand) {
+                self.emit_csg(cand);
+            }
+            nmask = (nmask - 1) & neigh;
+        }
+
+        // Second loop: recurse with X ∪ N(S1, X)
+        let x2 = x | neigh;
+        let mut nmask = neigh;
+        while nmask != 0 {
+            let cand = s1 | nmask;
+            if self.plans.contains_key(&cand) {
+                self.enumerate_csg_rec(cand, x2);
+            }
+            nmask = (nmask - 1) & neigh;
+        }
+    }
+
+    fn solve(&mut self, n: usize) {
+        // Solve(): main loop, v descending by id
+        for v in (0..n).rev() {
+            let s1 = 1u64 << v;
+            self.emit_csg(s1);
+
+            // Bv = {w | w ≺ v} ∪ {v} = {0..=v}
+            let bv = Self::prefix_mask_inclusive(v);
+            self.enumerate_csg_rec(s1, bv);
+        }
+    }
+}
+
+
 /// Run a DPhyp-style DP over the given join graph.
 ///
 /// - `base_cardinalities`: optional per-relation base cardinalities,
@@ -464,213 +740,16 @@ pub fn dphyp_optimize_join_graph<M: DPhypCostModel>(
             );
         }
 
-        // --- helpers (csg-cmp enumeration) ---
-        #[inline]
-        fn min_bit_index(mask: BitSet) -> usize {
-            debug_assert!(mask != 0);
-            mask.trailing_zeros() as usize
-        }
-
-        #[inline]
-        fn prefix_mask_inclusive(idx: usize) -> BitSet {
-            // {0..=idx}
-            if idx >= 63 {
-                u64::MAX
-            } else {
-                (1u64 << (idx + 1)) - 1
-            }
-        }
-
-        #[inline]
-        fn neighborhood(set: BitSet, exclude: BitSet, neighbors: &[BitSet], full: BitSet) -> BitSet {
-            // union of adjacency of vertices in `set`, minus `set` and minus `exclude`
-            let mut adj: BitSet = 0;
-            let mut m = set;
-            while m != 0 {
-                let v = m.trailing_zeros() as usize;
-                let bit = 1u64 << v;
-                m ^= bit;
-                adj |= neighbors[v];
-            }
-            adj &= full;
-            adj &= !set;
-            adj &= !exclude;
-            adj
-        }
-
-        #[inline]
-        fn nonzero_submasks(mask: BitSet) -> Vec<BitSet> {
-            let mut out = Vec::new();
-            let mut sub = mask;
-            while sub != 0 {
-                out.push(sub);
-                sub = (sub - 1) & mask;
-            }
-            out
-        }
-
-        fn emit_csg_cmp<M: DPhypCostModel>(
-            a: BitSet,
-            b: BitSet,
-            graph: &JoinGraph,
-            model: &M,
-            plans: &mut HashMap<BitSet, DPhypPlanEntry>,
-        ) {
-            if a == 0 || b == 0 {
-                return;
-            }
-            if (a & b) != 0 {
-                return;
-            }
-            if !has_cross_edge(a, b, graph) {
-                return;
-            }
-
-            let union = a | b;
-            let a_entry = match plans.get(&a) {
-                Some(e) => e.clone(),
-                None => return,
-            };
-            let b_entry = match plans.get(&b) {
-                Some(e) => e.clone(),
-                None => return,
-            };
-
-            // The paper enumerates each unordered csg-cmp pair only once, so we must
-            // consider both orientations here (important if the cost model is asymmetric).
-            for (left_mask, right_mask, left_e, right_e) in [
-                (a, b, a_entry.clone(), b_entry.clone()),
-                (b, a, b_entry, a_entry),
-            ] {
-                let (join_cost, result_card) = model.join_cost_cardinality(&left_e, &right_e, graph);
-                let candidate_cost = left_e.cost + right_e.cost + join_cost;
-                let better = match plans.get(&union) {
-                    Some(existing) => candidate_cost < existing.cost,
-                    None => true,
-                };
-                if better {
-                    plans.insert(
-                        union,
-                        DPhypPlanEntry {
-                            subset: union,
-                            left: Some(left_mask),
-                            right: Some(right_mask),
-                            cost: candidate_cost,
-                            cardinality: result_card,
-                        },
-                    );
-                }
-            }
-        }
-
-        fn enumerate_cmp_rec<M: DPhypCostModel>(
-            s1: BitSet,
-            s2: BitSet,
-            x: BitSet,
-            full: BitSet,
-            neighbors: &[BitSet],
-            graph: &JoinGraph,
-            model: &M,
-            plans: &mut HashMap<BitSet, DPhypPlanEntry>,
-        ) {
-            let neigh = neighborhood(s2, x, neighbors, full);
-            if neigh == 0 {
-                return;
-            }
-            let subs = nonzero_submasks(neigh);
-
-            // First loop: try to emit joinable complements
-            for nmask in &subs {
-                let cand = s2 | *nmask;
-                if plans.contains_key(&cand) && has_cross_edge(s1, cand, graph) {
-                    emit_csg_cmp(s1, cand, graph, model, plans);
-                }
-            }
-
-            // Second loop: recurse to extend S2
-            let x2 = x | neigh;
-            for nmask in subs {
-                let cand = s2 | nmask;
-                if plans.contains_key(&cand) {
-                    enumerate_cmp_rec(s1, cand, x2, full, neighbors, graph, model, plans);
-                }
-            }
-        }
-
-        fn emit_csg<M: DPhypCostModel>(
-            s1: BitSet,
-            full: BitSet,
-            neighbors: &[BitSet],
-            graph: &JoinGraph,
-            model: &M,
-            plans: &mut HashMap<BitSet, DPhypPlanEntry>,
-        ) {
-            // X = S1 ∪ Bmin(S1)
-            let min_idx = min_bit_index(s1);
-            let x = s1 | prefix_mask_inclusive(min_idx);
-
-            // N = N(S1, X)
-            let neigh = neighborhood(s1, x, neighbors, full);
-            if neigh == 0 {
-                return;
-            }
-
-            // for each v in N descending according to ≺
-            for v in (0..neighbors.len()).rev() {
-                let bit = 1u64 << v;
-                if (neigh & bit) == 0 {
-                    continue;
-                }
-                let s2 = bit;
-                if has_cross_edge(s1, s2, graph) {
-                    emit_csg_cmp(s1, s2, graph, model, plans);
-                }
-                enumerate_cmp_rec(s1, s2, x, full, neighbors, graph, model, plans);
-            }
-        }
-
-        fn enumerate_csg_rec<M: DPhypCostModel>(
-            s1: BitSet,
-            x: BitSet,
-            full: BitSet,
-            neighbors: &[BitSet],
-            graph: &JoinGraph,
-            model: &M,
-            plans: &mut HashMap<BitSet, DPhypPlanEntry>,
-        ) {
-            let neigh = neighborhood(s1, x, neighbors, full);
-            if neigh == 0 {
-                return;
-            }
-            let subs = nonzero_submasks(neigh);
-
-            // First loop: smaller sets must be processed first for DP validity
-            for nmask in &subs {
-                let cand = s1 | *nmask;
-                if plans.contains_key(&cand) {
-                    emit_csg(cand, full, neighbors, graph, model, plans);
-                }
-            }
-
-            // Second loop: recurse with X ∪ N(S1, X)
-            let x2 = x | neigh;
-            for nmask in subs {
-                let cand = s1 | nmask;
-                if plans.contains_key(&cand) {
-                    enumerate_csg_rec(cand, x2, full, neighbors, graph, model, plans);
-                }
-            }
-        }
-
-        // Solve(): main loop, v descending by id
-        for v in (0..n).rev() {
-            let s1 = 1u64 << v;
-            emit_csg(s1, full_mask, &neighbors, graph, model, &mut plans);
-
-            // Bv = {w | w ≺ v} ∪ {v} = {0..=v}
-            let bv = prefix_mask_inclusive(v);
-            enumerate_csg_rec(s1, bv, full_mask, &neighbors, graph, model, &mut plans);
-        }
+    {
+        let mut enumerator = DphypEnumerator::new(
+            graph,
+            model,
+            &neighbors,
+            full_mask,
+            &mut plans,
+        );
+        enumerator.solve(n);
+    }
 
         plans.get(&full_mask)?;
         Some(DPhypResult {
@@ -682,18 +761,14 @@ pub fn dphyp_optimize_join_graph<M: DPhypCostModel>(
 ///
 /// neighbors[i] has bits set for all j such that there exists at least one
 /// join predicate whose `rel_mask` contains *both* i and j.
-/// Build bitset neighbor masks for each relation in the join hypergraph.
-///
-/// neighbors[i] has bits set for all j such that there exists at least one
-/// join predicate or binary join edge whose support contains *both* i and j.
 fn build_neighbor_masks(graph: &JoinGraph) -> Vec<BitSet> {
     let n = graph.relations.len();
     let mut neighbors = vec![0u64; n];
 
-    // 1) Hyperedges: project each predicate's rel_mask to a clique
-    for pred in &graph.predicates {
+    // Connectivity/joinability for DP is based purely on hyper predicates.
+    // Each hyper predicate induces a clique among its participating relations.
+    for pred in &graph.hyper_predicates {
         let mut rels = pred.rel_mask;
-
         while rels != 0 {
             let i = rels.trailing_zeros() as usize;
             let bit_i = 1u64 << i;
@@ -704,18 +779,9 @@ fn build_neighbor_masks(graph: &JoinGraph) -> Vec<BitSet> {
         }
     }
 
-    // 2) Simple edges: also connect left/right directly
-    for edge in &graph.edges {
-        if edge.left < n && edge.right < n {
-            let l_bit = 1u64 << edge.left;
-            let r_bit = 1u64 << edge.right;
-            neighbors[edge.left] |= r_bit;
-            neighbors[edge.right] |= l_bit;
-        }
-    }
-
     neighbors
 }
+
 
 
 /// Count bits in a BitSet.
@@ -723,69 +789,19 @@ fn bit_count(mask: BitSet) -> usize {
     mask.count_ones() as usize
 }
 
-/// Check if `mask` induces a connected subgraph in the query graph
-/// represented by `neighbors`.
-fn is_connected_mask(mask: BitSet, neighbors: &[BitSet]) -> bool {
-    if mask == 0 {
-        return false;
-    }
-
-    // Start BFS from the lowest-numbered relation in `mask`.
-    let start = mask.trailing_zeros() as usize;
-    let mut visited: BitSet = 0;
-    let mut stack: Vec<usize> = Vec::new();
-
-    visited |= 1u64 << start;
-    stack.push(start);
-
-    while let Some(v) = stack.pop() {
-        let mut nbrs = neighbors[v] & mask;
-        while nbrs != 0 {
-            let idx = nbrs.trailing_zeros() as usize;
-            let bit = 1u64 << idx;
-            nbrs ^= bit;
-            if visited & bit == 0 {
-                visited |= bit;
-                stack.push(idx);
-            }
-        }
-    }
-
-    visited == mask
-}
-/// Check whether there is any join condition crossing the cut (A, B).
+/// Check whether there is any *hyper predicate* crossing the cut (A, B).
 ///
-/// We treat both:
-///   - hyperedges in `graph.predicates` (support sets with > 1 rel)
-///   - simple binary edges in `graph.edges`
-///
-/// as evidence that the cut is "joinable" (i.e., not a pure cross product).
-fn has_cross_edge(a: BitSet, b: BitSet, graph: &JoinGraph) -> bool {
-    // 1) Hyperedges: any predicate whose support intersects both A and B
-    for pred in &graph.predicates {
-        let mask = pred.rel_mask;
-        if (mask & a) != 0 && (mask & b) != 0 {
+/// DPhyp connectivity / joinability is defined purely by `graph.hyper_predicates`.
+/// `graph.binary_constraints` are reconstruction-only (to recover hash join keys).
+fn has_cross_hyper_predicate(a: BitSet, b: BitSet, graph: &JoinGraph) -> bool {
+    for pred in &graph.hyper_predicates {
+        let m = pred.rel_mask;
+        if (m & a) != 0 && (m & b) != 0 {
             return true;
         }
     }
-
-    // 2) Simple binary edges: any edge connecting a relation in A to one in B
-    for edge in &graph.edges {
-        let left_bit = 1u64 << edge.left;
-        let right_bit = 1u64 << edge.right;
-
-        let crosses =
-            (left_bit & a != 0 && right_bit & b != 0) ||
-                (left_bit & b != 0 && right_bit & a != 0);
-
-        if crosses {
-            return true;
-        }
-    }
-
     false
 }
-
 
 /// Rebuild the best join plan (LogicalPlan) for a join island
 /// described by `graph`, using the DP table in `dp`.
@@ -843,58 +859,71 @@ fn build_plan_for_subset(
     }
 }
 
-/// Build a filter expression for the join node that joins `left_subset` and
-/// `right_subset`.
-///
-/// For each JoinPredicate `p` in the hypergraph, we attach `p.expr` at the
-/// *lowest* join node whose subset contains all relations in `p.rel_mask`
-/// and where `p` crosses the cut (i.e. references at least one relation on
-/// each side).
-///
-/// This mirrors DuckDB's behavior: simple 2-way equi-joins become join keys,
-/// while more complex equalities over multiple relations are kept as filters.
-fn build_filter_for_cut(
+fn build_filter_for_cut_excluding_equi_keys(
     left_subset: BitSet,
     right_subset: BitSet,
     graph: &JoinGraph,
+    left_keys: &[Column],
+    right_keys: &[Column],
 ) -> Option<Expr> {
     let union = left_subset | right_subset;
     let mut exprs = Vec::new();
 
-    for pred in &graph.predicates {
+    for pred in &graph.hyper_predicates {
         let mask = pred.rel_mask;
         if mask == 0 {
             continue;
         }
 
-        // Predicate must mention at least one relation from *each* side
-        // of the cut, otherwise it is local to one child and will be
-        // attached lower in the tree.
+        // must cross the cut
         if (mask & left_subset) == 0 || (mask & right_subset) == 0 {
             continue;
         }
 
-        // All referenced relations must be available at this node.
+        // must be evaluable at this node
         if (mask & union) != mask {
             continue;
+        }
+
+        // If this is a simple Column = Column equality that is *already* one of our
+        // equi-join key pairs across this cut, don't also attach it as a join filter.
+        if let Some((lc, rc)) = extract_column_eq(&pred.expr) {
+            if is_key_pair(&lc, &rc, left_keys, right_keys) {
+                continue;
+            }
         }
 
         exprs.push(pred.expr.clone());
     }
 
-    // AND them together if there are any.
     conjunction(exprs)
 }
 
+fn extract_column_eq(expr: &Expr) -> Option<(Column, Column)> {
+    match expr {
+        Expr::BinaryExpr(be) if be.op == Operator::Eq => {
+            let l = as_column(&be.left)?;
+            let r = as_column(&be.right)?;
+            Some((l.clone(), r.clone()))
+        }
+        _ => None,
+    }
+}
 
-/// Build a Join node from two child plans and their subsets.
-///
-/// This:
-/// - collects all edges in the join graph that cross the (left_subset, right_subset) cut
-/// - orients each pair so that `left_cols[i]` refers to the left child,
-///   `right_cols[i]` refers to the right child
-/// - collects all hyperedge predicates that become valid at this node
-/// - builds a `LogicalPlan` via `LogicalPlanBuilder::join`
+fn is_key_pair(l: &Column, r: &Column, left_keys: &[Column], right_keys: &[Column]) -> bool {
+    debug_assert_eq!(left_keys.len(), right_keys.len());
+    for i in 0..left_keys.len() {
+        let lk = &left_keys[i];
+        let rk = &right_keys[i];
+
+        // match either orientation
+        if (l == lk && r == rk) || (l == rk && r == lk) {
+            return true;
+        }
+    }
+    false
+}
+
 fn build_join_for_children(
     left_subset: BitSet,
     left_plan: &LogicalPlan,
@@ -902,49 +931,45 @@ fn build_join_for_children(
     right_plan: &LogicalPlan,
     graph: &JoinGraph,
 ) -> DFResult<LogicalPlan> {
-    // Classic equi-join keys from 2-way JoinEdge entries.
     let (left_cols, right_cols) = join_keys_for_cut(left_subset, right_subset, graph)?;
 
-    // Hyperedge predicates that "cross" this cut and whose relation set
-    // is fully contained in left_subset ∪ right_subset.
-    let filter_expr = build_filter_for_cut(left_subset, right_subset, graph);
+    let filter_expr = build_filter_for_cut_excluding_equi_keys(
+        left_subset,
+        right_subset,
+        graph,
+        &left_cols,
+        &right_cols,
+    );
 
     let has_keys = !left_cols.is_empty();
 
     if !has_keys && filter_expr.is_none() {
-        // DP should never produce such a split: there must be at least
-        // one predicate hyperedge crossing the cut, otherwise the graph
-        // is disconnected. Treat as a safety check.
         return Err(DataFusionError::Plan(
             "DPhyp reconstruction: no join predicates across cut".to_string(),
         ));
     }
 
-    // Case 1: we have equi-join keys (possibly plus extra filters).
     if has_keys {
         return LogicalPlanBuilder::from(left_plan.clone())
             .join(
                 right_plan.clone(),
-                JoinType::Inner, // DPhyp currently only handles inner joins
+                JoinType::Inner,
                 (left_cols, right_cols),
                 filter_expr,
             )?
             .build();
     }
 
-    // Case 2: no binary equi-join keys, but there *is* a hyperedge that
-    // crosses the cut. Build a filter-only join (e.g. nested loop).
     LogicalPlanBuilder::from(left_plan.clone())
         .join(
             right_plan.clone(),
             JoinType::Inner,
-            // No key columns; planner will treat this as a non-equi join
-            // with a join filter.
             (Vec::<Column>::new(), Vec::<Column>::new()),
             filter_expr,
         )?
         .build()
 }
+
 
 
 /// For a given cut (left_subset, right_subset), collect all ON-clause
@@ -963,7 +988,7 @@ fn join_keys_for_cut(
     let mut left_cols = Vec::new();
     let mut right_cols = Vec::new();
 
-    for edge in &graph.edges {
+    for edge in &graph.binary_constraints {
         let left_bit = 1u64 << edge.left;
         let right_bit = 1u64 << edge.right;
 
@@ -1104,7 +1129,7 @@ impl<'a> PredicateSelectivityCostModel<'a> {
 
         // Multiply selectivities for all predicates whose support is
         // fully contained within `subset`.
-        for (idx, pred) in graph.predicates.iter().enumerate() {
+        for (idx, pred) in graph.hyper_predicates.iter().enumerate() {
             let rel_mask = pred.rel_mask;
             if rel_mask != 0 && (rel_mask & subset) == rel_mask {
                 card *= self.predicate_sel(idx);
@@ -1333,7 +1358,7 @@ impl<'a> StatsNdvCostModel<'a> {
         }
 
         // predicate selectivities, once per subset (no double counting)
-        for pred in &graph.predicates {
+        for pred in &graph.hyper_predicates {
             let rel_mask = pred.rel_mask;
             if rel_mask != 0 && (rel_mask & subset) == rel_mask {
                 card *= self.predicate_sel(&pred.expr, graph);
@@ -1450,6 +1475,32 @@ mod tests {
     use datafusion_expr::{logical_plan::LogicalPlanBuilder, Expr, JoinType, LogicalPlan, TableSource, TableProviderFilterPushDown, BinaryExpr};
     use std::collections::BTreeSet;
 
+    fn hyper_predicates_from_binary_constraints(edges: &[BinaryEquiConstraint]) -> Vec<HyperPredicate> {
+        use datafusion_expr::lit;
+
+        let mut preds = Vec::new();
+        for e in edges {
+            let rel_mask = (1u64 << e.left) | (1u64 << e.right);
+
+            if e.on.is_empty() {
+                // DP-only tests sometimes leave `on` empty; we still need connectivity.
+                preds.push(HyperPredicate {
+                    rel_mask,
+                    expr: lit(true),
+                });
+            } else {
+                for (l, r) in &e.on {
+                    preds.push(HyperPredicate {
+                        rel_mask,
+                        expr: l.clone().eq(r.clone()),
+                    });
+                }
+            }
+        }
+        preds
+    }
+
+
     /// Collect leaf table names (TableScan) under a subtree, sorted & deduped.
     fn leaf_table_set(plan: &LogicalPlan) -> BTreeSet<String> {
         let mut set = BTreeSet::new();
@@ -1547,7 +1598,7 @@ mod tests {
             .expect("some join graph");
 
         assert_eq!(graph.relations.len(), 2);
-        assert_eq!(graph.edges.len(), 1);
+        assert_eq!(graph.binary_constraints.len(), 1);
 
         let names: Vec<_> = graph.relations.iter().map(|r| r.name.as_str()).collect();
         assert!(names.contains(&"a"));
@@ -1561,29 +1612,36 @@ mod tests {
             id: 0,
             name: "A".to_string(),
             plan: dummy_scan("A"),
-            filters: vec![],
         };
         let rel_b = JoinRelation {
             id: 1,
             name: "B".to_string(),
             plan: dummy_scan("B"),
-            filters: vec![],
         };
 
         let relations = vec![rel_a, rel_b];
 
         let edges = vec![
             // A <-> B
-            JoinEdge {
+            BinaryEquiConstraint {
                 left: 0,
                 right: 1,
                 on: vec![],
             },
         ];
-        
-        let predicates = vec![];
 
-        let graph = JoinGraph { relations, edges, predicates };
+        let binary_constraints = vec![
+            BinaryEquiConstraint { left: 0, right: 1, on: vec![] },
+        ];
+
+        let hyper_predicates = hyper_predicates_from_binary_constraints(&binary_constraints);
+
+        let graph = JoinGraph {
+            relations,
+            binary_constraints,
+            hyper_predicates,
+        };
+
 
         // base cardinalities: |A| = 1000, |B| = 10
         let base = [1000.0_f64, 10.0_f64];
@@ -1637,41 +1695,43 @@ mod tests {
             id: 0,
             name: "A".to_string(),
             plan: dummy_scan("A"),
-            filters: vec![],
         };
         let rel_b = JoinRelation {
             id: 1,
             name: "B".to_string(),
             plan: dummy_scan("B"),
-            filters: vec![],
         };
         let rel_c = JoinRelation {
             id: 2,
             name: "C".to_string(),
             plan: dummy_scan("C"),
-            filters: vec![],
         };
 
         let relations = vec![rel_a, rel_b, rel_c];
 
-        let edges = vec![
+        let binary_constraints = vec![
             // A <-> B
-            JoinEdge {
+            BinaryEquiConstraint {
                 left: 0,
                 right: 1,
                 on: vec![],
             },
             // B <-> C
-            JoinEdge {
+            BinaryEquiConstraint {
                 left: 1,
                 right: 2,
                 on: vec![],
             },
         ];
 
-        let predicates = vec![];
+        let hyper_predicates = hyper_predicates_from_binary_constraints(&binary_constraints);
 
-        let graph = JoinGraph { relations, edges, predicates };
+        let graph = JoinGraph {
+            relations,
+            binary_constraints,
+            hyper_predicates,
+        };
+
 
         let base = [1000.0_f64, 10.0_f64, 1.0_f64];
 
@@ -1803,7 +1863,7 @@ mod tests {
             .expect("expected a join graph for three-way join");
 
         assert_eq!(graph.relations.len(), 3);
-        assert!(graph.edges.len() >= 2); // at least 2 join predicates
+        assert!(graph.binary_constraints.len() >= 2); // at least 2 join predicates
 
         // 2) Build base cardinalities per extracted relation id
         //
@@ -2033,7 +2093,7 @@ mod tests {
     fn unordered_edge_name_set(graph: &JoinGraph) -> HashSet<(String, String)> {
         let mut set = HashSet::new();
 
-        for edge in &graph.edges {
+        for edge in &graph.binary_constraints {
             let left_name = &graph.relations[edge.left].name;
             let right_name = &graph.relations[edge.right].name;
 
@@ -2079,39 +2139,40 @@ mod tests {
                 id: 0,
                 name: "a".to_string(),
                 plan: a_plan,
-                filters: vec![],
             },
             JoinRelation {
                 id: 1,
                 name: "b".to_string(),
                 plan: b_plan,
-                filters: vec![],
             },
             JoinRelation {
                 id: 2,
                 name: "c".to_string(),
                 plan: c_plan,
-                filters: vec![],
             },
         ];
 
         // edges: a - b, b - c
-        let edges = vec![
-            JoinEdge {
+        let binary_constraints = vec![
+            BinaryEquiConstraint {
                 left: 0,
                 right: 1,
                 on: vec![(col_ref(&a_ref, "id"), col_ref(&b_ref, "id"))],
             },
-            JoinEdge {
+            BinaryEquiConstraint {
                 left: 1,
                 right: 2,
                 on: vec![(col_ref(&b_ref, "id"), col_ref(&c_ref, "id"))],
             },
         ];
 
-        let predicates = vec![];
+        let hyper_predicates = hyper_predicates_from_binary_constraints(&binary_constraints);
 
-        let graph = JoinGraph { relations, edges, predicates };
+        let graph = JoinGraph {
+            relations,
+            binary_constraints,
+            hyper_predicates,
+        };
 
         // Run DP with the simple placeholder cost model
         let model = SimpleCardinalityCostModel { base_cardinalities: None };
@@ -2162,49 +2223,50 @@ mod tests {
                 id: 0,
                 name: "a".to_string(),
                 plan: a_plan,
-                filters: vec![],
             },
             JoinRelation {
                 id: 1,
                 name: "b".to_string(),
                 plan: b_plan,
-                filters: vec![],
             },
             JoinRelation {
                 id: 2,
                 name: "c".to_string(),
                 plan: c_plan,
-                filters: vec![],
             },
             JoinRelation {
                 id: 3,
                 name: "d".to_string(),
                 plan: d_plan,
-                filters: vec![],
             },
         ];
 
-        let edges = vec![
-            JoinEdge {
+        let binary_constraints = vec![
+            BinaryEquiConstraint {
                 left: 0,
                 right: 1,
                 on: vec![(col_ref(&a_ref, "id"), col_ref(&b_ref, "id"))],
             },
-            JoinEdge {
+            BinaryEquiConstraint {
                 left: 1,
                 right: 2,
                 on: vec![(col_ref(&b_ref, "id"), col_ref(&c_ref, "id"))],
             },
-            JoinEdge {
+            BinaryEquiConstraint {
                 left: 2,
                 right: 3,
                 on: vec![(col_ref(&c_ref, "id"), col_ref(&d_ref, "id"))],
             },
         ];
 
-        let predicates = vec![];
 
-        let graph = JoinGraph { relations, edges, predicates };
+        let hyper_predicates = hyper_predicates_from_binary_constraints(&binary_constraints);
+
+        let graph = JoinGraph {
+            relations,
+            binary_constraints,
+            hyper_predicates,
+        };
 
         let model = SimpleCardinalityCostModel { base_cardinalities: None };
         let dp = dphyp_optimize_join_graph(&graph, &model)
@@ -2313,13 +2375,13 @@ mod tests {
         assert_eq!(graph.relations.len(), 3);
 
         // From the inner a=b equi-join we get one binary edge.
-        assert_eq!(graph.edges.len(), 1);
+        assert_eq!(graph.binary_constraints.len(), 1);
 
         // Predicates: one for a.id = b.id, one for a.id + b.id = c.id
-        assert_eq!(graph.predicates.len(), 2);
+        assert_eq!(graph.hyper_predicates.len(), 2);
 
         let mask_counts: Vec<_> = graph
-            .predicates
+            .hyper_predicates
             .iter()
             .map(|p| bit_count(p.rel_mask))
             .collect();
@@ -2343,19 +2405,16 @@ mod tests {
             id: 0,
             name: "A".to_string(),
             plan: dummy_scan("A"),
-            filters: vec![],
         };
         let rel_b = JoinRelation {
             id: 1,
             name: "B".to_string(),
             plan: dummy_scan("B"),
-            filters: vec![],
         };
         let rel_c = JoinRelation {
             id: 2,
             name: "C".to_string(),
             plan: dummy_scan("C"),
-            filters: vec![],
         };
 
         let relations = vec![rel_a, rel_b, rel_c];
@@ -2370,7 +2429,7 @@ mod tests {
 
         let hyper_mask: BitSet = (1u64 << 0) | (1u64 << 1) | (1u64 << 2);
 
-        let predicates = vec![JoinPredicate {
+        let predicates = vec![HyperPredicate {
             rel_mask: hyper_mask,
             expr: expr_left.eq(expr_right),
         }];
@@ -2380,8 +2439,8 @@ mod tests {
 
         let graph = JoinGraph {
             relations,
-            edges,
-            predicates,
+            binary_constraints: edges,
+            hyper_predicates: predicates,
         };
 
         // Some arbitrary base cardinalities, just to exercise the model.
@@ -2423,19 +2482,16 @@ mod tests {
             id: 0,
             name: "A".to_string(),
             plan: dummy_scan("A"),
-            filters: vec![],
         };
         let rel_b = JoinRelation {
             id: 1,
             name: "B".to_string(),
             plan: dummy_scan("B"),
-            filters: vec![],
         };
         let rel_c = JoinRelation {
             id: 2,
             name: "C".to_string(),
             plan: dummy_scan("C"),
-            filters: vec![],
         };
 
         let relations = vec![rel_a, rel_b, rel_c];
@@ -2446,12 +2502,12 @@ mod tests {
 
         // Binary edges: A-B and B-C
         let edges = vec![
-            JoinEdge {
+            BinaryEquiConstraint {
                 left: 0,
                 right: 1,
                 on: vec![(col_ref(&a_ref, "id"), col_ref(&b_ref, "id"))],
             },
-            JoinEdge {
+            BinaryEquiConstraint {
                 left: 1,
                 right: 2,
                 on: vec![(col_ref(&b_ref, "id"), col_ref(&c_ref, "id"))],
@@ -2461,12 +2517,12 @@ mod tests {
         // Hypergraph predicates matching the same equalities
         let predicates = vec![
             // p0: A.id = B.id  (mask {A,B})
-            JoinPredicate {
+            HyperPredicate {
                 rel_mask: (1u64 << 0) | (1u64 << 1),
                 expr: col_ref(&a_ref, "id").eq(col_ref(&b_ref, "id")),
             },
             // p1: B.id = C.id  (mask {B,C})
-            JoinPredicate {
+            HyperPredicate {
                 rel_mask: (1u64 << 1) | (1u64 << 2),
                 expr: col_ref(&b_ref, "id").eq(col_ref(&c_ref, "id")),
             },
@@ -2474,8 +2530,8 @@ mod tests {
 
         let graph = JoinGraph {
             relations,
-            edges,
-            predicates,
+            binary_constraints: edges,
+            hyper_predicates: predicates,
         };
 
         // Base cardinalities: all equal
@@ -2566,10 +2622,10 @@ mod tests {
         // We should have exactly two base relations, no equi-edges,
         // and one predicate hyperedge over both relations.
         assert_eq!(graph.relations.len(), 2);
-        assert!(graph.edges.is_empty(), "no equi-join edges expected");
-        assert_eq!(graph.predicates.len(), 1);
+        assert!(graph.binary_constraints.is_empty(), "no equi-join edges expected");
+        assert_eq!(graph.hyper_predicates.len(), 1);
 
-        let pred = &graph.predicates[0];
+        let pred = &graph.hyper_predicates[0];
         // Predicate must reference exactly the two relations in this island.
         assert_eq!(pred.rel_mask.count_ones(), 2);
 
@@ -2963,19 +3019,16 @@ mod tests {
             id: 0,
             name: "A".to_string(),
             plan: dummy_scan("A"),
-            filters: vec![],
         };
         let rel_b = JoinRelation {
             id: 1,
             name: "B".to_string(),
             plan: dummy_scan("B"),
-            filters: vec![],
         };
         let rel_c = JoinRelation {
             id: 2,
             name: "C".to_string(),
             plan: dummy_scan("C"),
-            filters: vec![],
         };
 
         let relations = vec![rel_a, rel_b, rel_c];
@@ -2986,12 +3039,12 @@ mod tests {
 
         // Simple edges (not required for hyper connectivity here, but consistent with the rest)
         let edges = vec![
-            JoinEdge {
+            BinaryEquiConstraint {
                 left: 0,
                 right: 1,
                 on: vec![(col_ref(&a_ref, "id1"), col_ref(&b_ref, "id1"))],
             },
-            JoinEdge {
+            BinaryEquiConstraint {
                 left: 1,
                 right: 2,
                 on: vec![(col_ref(&b_ref, "id2"), col_ref(&c_ref, "id2"))],
@@ -3000,11 +3053,11 @@ mod tests {
 
         // Hypergraph predicates
         let predicates = vec![
-            JoinPredicate {
+            HyperPredicate {
                 rel_mask: (1u64 << 0) | (1u64 << 1),
                 expr: col_ref(&a_ref, "id1").eq(col_ref(&b_ref, "id1")),
             },
-            JoinPredicate {
+            HyperPredicate {
                 rel_mask: (1u64 << 1) | (1u64 << 2),
                 expr: col_ref(&b_ref, "id2").eq(col_ref(&c_ref, "id2")),
             },
@@ -3012,8 +3065,8 @@ mod tests {
 
         let graph = JoinGraph {
             relations,
-            edges,
-            predicates,
+            binary_constraints: edges,
+            hyper_predicates: predicates,
         };
 
         // Dummy StatsProvider for the test
