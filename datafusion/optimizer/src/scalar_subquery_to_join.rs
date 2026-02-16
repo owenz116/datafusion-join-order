@@ -35,8 +35,10 @@ use datafusion_common::{
 };
 use datafusion_expr::expr_rewriter::create_col_from_scalar_expr;
 use datafusion_expr::logical_plan::{JoinType, Subquery};
-use datafusion_expr::utils::conjunction;
-use datafusion_expr::{expr, EmptyRelation, Expr, LogicalPlan, LogicalPlanBuilder};
+use datafusion_expr::utils::{conjunction, split_conjunction};
+use datafusion_expr::{
+    binary_expr, expr, EmptyRelation, Expr, LogicalPlan, LogicalPlanBuilder, Operator,
+};
 
 /// Optimizer rule for rewriting subquery filters to joins
 /// and places additional projection on top of the filter, to preserve
@@ -312,7 +314,7 @@ fn build_join(
     let mut pull_up = PullUpCorrelatedExpr::new().with_need_handle_count_bug(true);
     let new_plan = subquery_plan.clone().rewrite(&mut pull_up).data()?;
     if !pull_up.can_pull_up {
-        return Ok(None);
+        return build_join_with_domain_keys(subquery_plan, filter_input, subquery_alias);
     }
 
     let collected_count_expr_map =
@@ -408,6 +410,387 @@ fn build_join(
     Ok(Some((new_plan, computation_project_expr)))
 }
 
+/// Fallback rewrite for correlated scalar aggregates that `PullUpCorrelatedExpr` currently
+/// cannot decorrelate (for example non-equality/disjunctive correlated predicates).
+///
+/// This implements a constrained domain-key rewrite:
+/// - required root shape: Projection -> [local Filter]* -> Aggregate
+/// - aggregate input supports local Projection/Filter layers above one correlated Filter
+/// - the only outer references must be in that correlated Filter predicate
+fn build_join_with_domain_keys(
+    subquery_plan: &LogicalPlan,
+    filter_input: &LogicalPlan,
+    subquery_alias: &str,
+) -> Result<Option<(LogicalPlan, HashMap<String, Expr>)>> {
+    let LogicalPlan::Projection(top_projection) = subquery_plan else {
+        return Ok(None);
+    };
+    if top_projection.expr.iter().any(Expr::contains_outer) {
+        return Ok(None);
+    }
+
+    let mut post_aggregate_filters = vec![];
+    let mut aggregate_plan = top_projection.input.as_ref();
+    while let LogicalPlan::Filter(filter) = aggregate_plan {
+        if filter.predicate.contains_outer() {
+            return Ok(None);
+        }
+        post_aggregate_filters.push(filter.predicate.clone());
+        aggregate_plan = filter.input.as_ref();
+    }
+
+    let LogicalPlan::Aggregate(aggregate) = aggregate_plan else {
+        return Ok(None);
+    };
+    if aggregate.group_expr.iter().any(Expr::contains_outer)
+        || aggregate.aggr_expr.iter().any(Expr::contains_outer)
+    {
+        return Ok(None);
+    }
+
+    let mut pre_aggregate_unary_nodes = vec![];
+    let mut aggregate_input_plan = aggregate.input.as_ref();
+    let correlated_filter = loop {
+        match aggregate_input_plan {
+            LogicalPlan::Filter(filter) => {
+                if filter.predicate.contains_outer() {
+                    break filter;
+                }
+                pre_aggregate_unary_nodes
+                    .push(DomainRewriteUnaryNode::Filter(filter.predicate.clone()));
+                aggregate_input_plan = filter.input.as_ref();
+            }
+            LogicalPlan::Projection(projection) => {
+                if projection.expr.iter().any(Expr::contains_outer) {
+                    return Ok(None);
+                }
+                pre_aggregate_unary_nodes
+                    .push(DomainRewriteUnaryNode::Projection(projection.expr.clone()));
+                aggregate_input_plan = projection.input.as_ref();
+            }
+            _ => return Ok(None),
+        }
+    };
+    if !correlated_filter.predicate.contains_outer()
+        || correlated_filter.input.contains_outer_reference()
+    {
+        return Ok(None);
+    }
+    let preserve_domain_relation = !pre_aggregate_unary_nodes
+        .iter()
+        .any(|node| matches!(node, DomainRewriteUnaryNode::Projection(_)));
+
+    let mut empty_batch_expr_map = HashMap::new();
+    for (name, expr) in
+        projection_empty_batch_results(&aggregate.aggr_expr, &top_projection.expr)?
+    {
+        if !evaluates_to_null(expr.clone(), expr.column_refs())? {
+            empty_batch_expr_map.insert(name, expr);
+        }
+    }
+    // Post-aggregate filters (HAVING) can suppress the aggregate row, so nulls from
+    // left join are ambiguous with empty-input cases. Keep this conservative until
+    // count+having pull-up is implemented for the domain fallback.
+    if !empty_batch_expr_map.is_empty() && !post_aggregate_filters.is_empty() {
+        return Ok(None);
+    }
+
+    let outer_cols = collect_outer_reference_columns(subquery_plan);
+    if outer_cols.is_empty() {
+        return Ok(None);
+    }
+
+    let domain_alias = format!("{subquery_alias}_domain");
+    let mut outer_col_to_domain_col = HashMap::new();
+    let mut domain_project_exprs = Vec::with_capacity(outer_cols.len());
+    let mut domain_col_names = Vec::with_capacity(outer_cols.len());
+    for (idx, outer_col) in outer_cols.iter().enumerate() {
+        let domain_col_name = format!("__correlated_sq_col_{idx}");
+        outer_col_to_domain_col.insert(outer_col.clone(), domain_col_name.clone());
+        domain_col_names.push(domain_col_name.clone());
+        domain_project_exprs.push(Expr::Column(outer_col.clone()).alias(domain_col_name));
+    }
+
+    let domain_plan = LogicalPlanBuilder::from(filter_input.clone())
+        .project(domain_project_exprs)?
+        .distinct()?
+        .alias(domain_alias.clone())?
+        .build()?;
+
+    let (correlated_filters, local_filters): (Vec<_>, Vec<_>) =
+        split_conjunction(&correlated_filter.predicate)
+            .into_iter()
+            .partition(|expr| expr.contains_outer());
+    if correlated_filters.is_empty() {
+        return Ok(None);
+    }
+
+    let rewritten_correlated_filters = correlated_filters
+        .into_iter()
+        .map(|expr| {
+            replace_outer_refs_with_domain_cols(
+                expr.clone(),
+                &outer_col_to_domain_col,
+                &domain_alias,
+            )
+        })
+        .collect::<Result<Vec<_>>>()?;
+
+    if rewritten_correlated_filters
+        .iter()
+        .any(Expr::contains_outer)
+    {
+        return Ok(None);
+    }
+
+    let mut rewritten_input = LogicalPlanBuilder::from(domain_plan)
+        .join_on(
+            correlated_filter.input.as_ref().clone(),
+            JoinType::Inner,
+            rewritten_correlated_filters,
+        )?
+        .build()?;
+
+    if let Some(local_filter) =
+        conjunction(local_filters.into_iter().cloned().collect::<Vec<_>>())
+    {
+        rewritten_input = LogicalPlanBuilder::from(rewritten_input)
+            .filter(local_filter)?
+            .build()?;
+    }
+
+    for unary_node in pre_aggregate_unary_nodes.into_iter().rev() {
+        rewritten_input = match unary_node {
+            DomainRewriteUnaryNode::Filter(predicate) => {
+                LogicalPlanBuilder::from(rewritten_input)
+                    .filter(predicate)?
+                    .build()?
+            }
+            DomainRewriteUnaryNode::Projection(exprs) => {
+                let mut projection_exprs = exprs;
+                for domain_col_name in &domain_col_names {
+                    if projection_exprs
+                        .iter()
+                        .any(|expr| expr_output_name(expr) == *domain_col_name)
+                    {
+                        continue;
+                    }
+                    projection_exprs.push(
+                        Expr::Column(Column::new(
+                            Some(domain_alias.clone()),
+                            domain_col_name.clone(),
+                        ))
+                        .alias(domain_col_name.clone()),
+                    );
+                }
+                LogicalPlanBuilder::from(rewritten_input)
+                    .project(projection_exprs)?
+                    .build()?
+            }
+        };
+    }
+
+    let mut group_expr = aggregate.group_expr.clone();
+    for domain_col_name in &domain_col_names {
+        let domain_group_col = if preserve_domain_relation {
+            Expr::Column(Column::new(
+                Some(domain_alias.clone()),
+                domain_col_name.clone(),
+            ))
+        } else {
+            Expr::Column(Column::new_unqualified(domain_col_name.clone()))
+        };
+        group_expr.push(domain_group_col.alias(domain_col_name.clone()));
+    }
+
+    let rewritten_aggregate = LogicalPlanBuilder::from(rewritten_input)
+        .aggregate(group_expr, aggregate.aggr_expr.clone())?
+        .build()?;
+
+    let mut rewritten_subquery_input = rewritten_aggregate;
+    for predicate in post_aggregate_filters.into_iter().rev() {
+        rewritten_subquery_input = LogicalPlanBuilder::from(rewritten_subquery_input)
+            .filter(predicate)?
+            .build()?;
+    }
+
+    let mut rewritten_projection_exprs = top_projection.expr.clone();
+    for domain_col_name in &domain_col_names {
+        rewritten_projection_exprs.push(Expr::Column(Column::new_unqualified(
+            domain_col_name.clone(),
+        )));
+    }
+    if !empty_batch_expr_map.is_empty() {
+        rewritten_projection_exprs.push(
+            Expr::Literal(ScalarValue::Boolean(Some(true)), None)
+                .alias(UN_MATCHED_ROW_INDICATOR),
+        );
+    }
+
+    let rewritten_subquery = LogicalPlanBuilder::from(rewritten_subquery_input)
+        .project(rewritten_projection_exprs)?
+        .alias(subquery_alias.to_string())?
+        .build()?;
+
+    // Match outer rows to the corresponding domain-key aggregate row.
+    let domain_join_filters = outer_cols
+        .into_iter()
+        .zip(domain_col_names)
+        .map(|(outer_col, domain_col_name)| {
+            binary_expr(
+                Expr::Column(outer_col),
+                Operator::IsNotDistinctFrom,
+                Expr::Column(Column::new(
+                    Some(subquery_alias.to_string()),
+                    domain_col_name,
+                )),
+            )
+        })
+        .collect::<Vec<_>>();
+
+    let rewritten_plan = LogicalPlanBuilder::from(filter_input.clone())
+        .join_on(rewritten_subquery, JoinType::Left, domain_join_filters)?
+        .build()?;
+
+    let mut computation_project_expr = HashMap::new();
+    for (name, result) in empty_batch_expr_map {
+        let computer_expr = Expr::Case(expr::Case {
+            expr: None,
+            when_then_expr: vec![(
+                Box::new(Expr::IsNull(Box::new(Expr::Column(
+                    Column::new_unqualified(UN_MATCHED_ROW_INDICATOR),
+                )))),
+                Box::new(result),
+            )],
+            else_expr: Some(Box::new(Expr::Column(Column::new_unqualified(
+                name.clone(),
+            )))),
+        });
+        let mut expr_rewrite = TypeCoercionRewriter {
+            schema: rewritten_plan.schema(),
+        };
+        computation_project_expr
+            .insert(name, computer_expr.rewrite(&mut expr_rewrite).data()?);
+    }
+
+    Ok(Some((rewritten_plan, computation_project_expr)))
+}
+
+fn collect_outer_reference_columns(plan: &LogicalPlan) -> Vec<Column> {
+    let mut outer_cols = vec![];
+    for expr in plan.all_out_ref_exprs() {
+        if let Expr::OuterReferenceColumn(_, col) = expr {
+            if !outer_cols.contains(&col) {
+                outer_cols.push(col);
+            }
+        }
+    }
+    outer_cols
+}
+
+fn replace_outer_refs_with_domain_cols(
+    expr: Expr,
+    outer_col_to_domain_col: &HashMap<Column, String>,
+    domain_alias: &str,
+) -> Result<Expr> {
+    expr.transform_up(|expr| match expr {
+        Expr::OuterReferenceColumn(_, col) => {
+            if let Some(domain_col) = outer_col_to_domain_col.get(&col) {
+                Ok(Transformed::yes(Expr::Column(Column::new(
+                    Some(domain_alias.to_string()),
+                    domain_col.clone(),
+                ))))
+            } else {
+                plan_err!(
+                    "Can not map correlated column {col} into generated scalar-subquery domain"
+                )
+            }
+        }
+        _ => Ok(Transformed::no(expr)),
+    })
+    .data()
+}
+
+#[derive(Debug)]
+enum DomainRewriteUnaryNode {
+    Filter(Expr),
+    Projection(Vec<Expr>),
+}
+
+fn projection_empty_batch_results(
+    aggregate_exprs: &[Expr],
+    projection_exprs: &[Expr],
+) -> Result<HashMap<String, Expr>> {
+    let mut aggregate_empty_results = HashMap::new();
+    for aggregate_expr in aggregate_exprs {
+        let result_expr = aggregate_expr
+            .clone()
+            .transform_up(|expr| {
+                let new_expr = match expr {
+                    Expr::AggregateFunction(expr::AggregateFunction { func, .. }) => {
+                        if func.name() == "count" {
+                            Transformed::yes(Expr::Literal(
+                                ScalarValue::Int64(Some(0)),
+                                None,
+                            ))
+                        } else {
+                            Transformed::yes(Expr::Literal(ScalarValue::Null, None))
+                        }
+                    }
+                    _ => Transformed::no(expr),
+                };
+                Ok(new_expr)
+            })
+            .data()?;
+        aggregate_empty_results.insert(expr_output_name(aggregate_expr), result_expr);
+    }
+
+    let mut projection_empty_results = HashMap::new();
+    for projection_expr in projection_exprs {
+        let result_expr = projection_expr
+            .clone()
+            .transform_up(|expr| {
+                let new_expr = match expr {
+                    Expr::AggregateFunction(expr::AggregateFunction { func, .. }) => {
+                        if func.name() == "count" {
+                            Transformed::yes(Expr::Literal(
+                                ScalarValue::Int64(Some(0)),
+                                None,
+                            ))
+                        } else {
+                            Transformed::yes(Expr::Literal(ScalarValue::Null, None))
+                        }
+                    }
+                    Expr::Column(col) => {
+                        let name = col.name.clone();
+                        if let Some(result_expr) = aggregate_empty_results.get(&name) {
+                            Transformed::yes(result_expr.clone())
+                        } else {
+                            Transformed::no(Expr::Column(col))
+                        }
+                    }
+                    _ => Transformed::no(expr),
+                };
+                Ok(new_expr)
+            })
+            .data()?;
+        if result_expr.ne(projection_expr) {
+            projection_empty_results
+                .insert(expr_output_name(projection_expr), result_expr.unalias());
+        }
+    }
+
+    Ok(projection_empty_results)
+}
+
+fn expr_output_name(expr: &Expr) -> String {
+    match expr {
+        Expr::Alias(expr::Alias { name, .. }) => name.to_string(),
+        Expr::Column(Column { name, .. }) => name.to_string(),
+        _ => expr.schema_name().to_string(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::ops::Add;
@@ -420,6 +803,7 @@ mod tests {
 
     use crate::assert_optimized_plan_eq_display_indent_snapshot;
     use datafusion_expr::{col, lit, out_ref_col, scalar_subquery, Between};
+    use datafusion_functions_aggregate::expr_fn::count;
     use datafusion_functions_aggregate::min_max::{max, min};
 
     macro_rules! assert_optimized_plan_equal {
@@ -662,18 +1046,24 @@ mod tests {
             .project(vec![col("customer.c_custkey")])?
             .build()?;
 
-        // Unsupported predicate, subquery should not be decorrelated
+        // Correlated non-equality scalar predicate can be decorrelated through domain keys.
         assert_optimized_plan_equal!(
             plan,
             @r"
         Projection: customer.c_custkey [c_custkey:Int64]
-          Filter: customer.c_custkey = (<subquery>) [c_custkey:Int64, c_name:Utf8]
-            Subquery: [max(orders.o_custkey):Int64;N]
-              Projection: max(orders.o_custkey) [max(orders.o_custkey):Int64;N]
-                Aggregate: groupBy=[[]], aggr=[[max(orders.o_custkey)]] [max(orders.o_custkey):Int64;N]
-                  Filter: outer_ref(customer.c_custkey) != orders.o_custkey [o_orderkey:Int64, o_custkey:Int64, o_orderstatus:Utf8, o_totalprice:Float64;N]
-                    TableScan: orders [o_orderkey:Int64, o_custkey:Int64, o_orderstatus:Utf8, o_totalprice:Float64;N]
-            TableScan: customer [c_custkey:Int64, c_name:Utf8]
+          Projection: customer.c_custkey, customer.c_name [c_custkey:Int64, c_name:Utf8]
+            Filter: customer.c_custkey = __scalar_sq_1.max(orders.o_custkey) [c_custkey:Int64, c_name:Utf8, max(orders.o_custkey):Int64;N, __correlated_sq_col_0:Int64;N]
+              Left Join:  Filter: customer.c_custkey IS NOT DISTINCT FROM __scalar_sq_1.__correlated_sq_col_0 [c_custkey:Int64, c_name:Utf8, max(orders.o_custkey):Int64;N, __correlated_sq_col_0:Int64;N]
+                TableScan: customer [c_custkey:Int64, c_name:Utf8]
+                SubqueryAlias: __scalar_sq_1 [max(orders.o_custkey):Int64;N, __correlated_sq_col_0:Int64]
+                  Projection: max(orders.o_custkey), __correlated_sq_col_0 [max(orders.o_custkey):Int64;N, __correlated_sq_col_0:Int64]
+                    Aggregate: groupBy=[[__scalar_sq_1_domain.__correlated_sq_col_0 AS __correlated_sq_col_0]], aggr=[[max(orders.o_custkey)]] [__correlated_sq_col_0:Int64, max(orders.o_custkey):Int64;N]
+                      Inner Join:  Filter: __scalar_sq_1_domain.__correlated_sq_col_0 != orders.o_custkey [__correlated_sq_col_0:Int64, o_orderkey:Int64, o_custkey:Int64, o_orderstatus:Utf8, o_totalprice:Float64;N]
+                        SubqueryAlias: __scalar_sq_1_domain [__correlated_sq_col_0:Int64]
+                          Distinct: [__correlated_sq_col_0:Int64]
+                            Projection: customer.c_custkey AS __correlated_sq_col_0 [__correlated_sq_col_0:Int64]
+                              TableScan: customer [c_custkey:Int64, c_name:Utf8]
+                        TableScan: orders [o_orderkey:Int64, o_custkey:Int64, o_orderstatus:Utf8, o_totalprice:Float64;N]
         "
         )
     }
@@ -697,18 +1087,64 @@ mod tests {
             .project(vec![col("customer.c_custkey")])?
             .build()?;
 
-        // Unsupported predicate, subquery should not be decorrelated
+        // Correlated non-equality scalar predicate can be decorrelated through domain keys.
         assert_optimized_plan_equal!(
             plan,
             @r"
         Projection: customer.c_custkey [c_custkey:Int64]
-          Filter: customer.c_custkey = (<subquery>) [c_custkey:Int64, c_name:Utf8]
-            Subquery: [max(orders.o_custkey):Int64;N]
-              Projection: max(orders.o_custkey) [max(orders.o_custkey):Int64;N]
-                Aggregate: groupBy=[[]], aggr=[[max(orders.o_custkey)]] [max(orders.o_custkey):Int64;N]
-                  Filter: outer_ref(customer.c_custkey) < orders.o_custkey [o_orderkey:Int64, o_custkey:Int64, o_orderstatus:Utf8, o_totalprice:Float64;N]
-                    TableScan: orders [o_orderkey:Int64, o_custkey:Int64, o_orderstatus:Utf8, o_totalprice:Float64;N]
-            TableScan: customer [c_custkey:Int64, c_name:Utf8]
+          Projection: customer.c_custkey, customer.c_name [c_custkey:Int64, c_name:Utf8]
+            Filter: customer.c_custkey = __scalar_sq_1.max(orders.o_custkey) [c_custkey:Int64, c_name:Utf8, max(orders.o_custkey):Int64;N, __correlated_sq_col_0:Int64;N]
+              Left Join:  Filter: customer.c_custkey IS NOT DISTINCT FROM __scalar_sq_1.__correlated_sq_col_0 [c_custkey:Int64, c_name:Utf8, max(orders.o_custkey):Int64;N, __correlated_sq_col_0:Int64;N]
+                TableScan: customer [c_custkey:Int64, c_name:Utf8]
+                SubqueryAlias: __scalar_sq_1 [max(orders.o_custkey):Int64;N, __correlated_sq_col_0:Int64]
+                  Projection: max(orders.o_custkey), __correlated_sq_col_0 [max(orders.o_custkey):Int64;N, __correlated_sq_col_0:Int64]
+                    Aggregate: groupBy=[[__scalar_sq_1_domain.__correlated_sq_col_0 AS __correlated_sq_col_0]], aggr=[[max(orders.o_custkey)]] [__correlated_sq_col_0:Int64, max(orders.o_custkey):Int64;N]
+                      Inner Join:  Filter: __scalar_sq_1_domain.__correlated_sq_col_0 < orders.o_custkey [__correlated_sq_col_0:Int64, o_orderkey:Int64, o_custkey:Int64, o_orderstatus:Utf8, o_totalprice:Float64;N]
+                        SubqueryAlias: __scalar_sq_1_domain [__correlated_sq_col_0:Int64]
+                          Distinct: [__correlated_sq_col_0:Int64]
+                            Projection: customer.c_custkey AS __correlated_sq_col_0 [__correlated_sq_col_0:Int64]
+                              TableScan: customer [c_custkey:Int64, c_name:Utf8]
+                        TableScan: orders [o_orderkey:Int64, o_custkey:Int64, o_orderstatus:Utf8, o_totalprice:Float64;N]
+        "
+        )
+    }
+
+    /// Test for correlated scalar subquery not equal with count(*)
+    #[test]
+    fn scalar_subquery_where_not_eq_count() -> Result<()> {
+        let sq = Arc::new(
+            LogicalPlanBuilder::from(scan_tpch_table("orders"))
+                .filter(
+                    out_ref_col(DataType::Int64, "customer.c_custkey")
+                        .not_eq(col("orders.o_custkey")),
+                )?
+                .aggregate(Vec::<Expr>::new(), vec![count(lit(1))])?
+                .project(vec![count(lit(1))])?
+                .build()?,
+        );
+
+        let plan = LogicalPlanBuilder::from(scan_tpch_table("customer"))
+            .filter(col("customer.c_custkey").lt(scalar_subquery(sq)))?
+            .project(vec![col("customer.c_custkey")])?
+            .build()?;
+
+        assert_optimized_plan_equal!(
+            plan,
+            @r"
+        Projection: customer.c_custkey [c_custkey:Int64]
+          Projection: customer.c_custkey, customer.c_name [c_custkey:Int64, c_name:Utf8]
+            Filter: customer.c_custkey < CASE WHEN __scalar_sq_1.__always_true IS NULL THEN Int64(0) ELSE __scalar_sq_1.count(Int32(1)) END [c_custkey:Int64, c_name:Utf8, count(Int32(1)):Int64;N, __correlated_sq_col_0:Int64;N, __always_true:Boolean;N]
+              Left Join:  Filter: customer.c_custkey IS NOT DISTINCT FROM __scalar_sq_1.__correlated_sq_col_0 [c_custkey:Int64, c_name:Utf8, count(Int32(1)):Int64;N, __correlated_sq_col_0:Int64;N, __always_true:Boolean;N]
+                TableScan: customer [c_custkey:Int64, c_name:Utf8]
+                SubqueryAlias: __scalar_sq_1 [count(Int32(1)):Int64, __correlated_sq_col_0:Int64, __always_true:Boolean]
+                  Projection: count(Int32(1)), __correlated_sq_col_0, Boolean(true) AS __always_true [count(Int32(1)):Int64, __correlated_sq_col_0:Int64, __always_true:Boolean]
+                    Aggregate: groupBy=[[__scalar_sq_1_domain.__correlated_sq_col_0 AS __correlated_sq_col_0]], aggr=[[count(Int32(1))]] [__correlated_sq_col_0:Int64, count(Int32(1)):Int64]
+                      Inner Join:  Filter: __scalar_sq_1_domain.__correlated_sq_col_0 != orders.o_custkey [__correlated_sq_col_0:Int64, o_orderkey:Int64, o_custkey:Int64, o_orderstatus:Utf8, o_totalprice:Float64;N]
+                        SubqueryAlias: __scalar_sq_1_domain [__correlated_sq_col_0:Int64]
+                          Distinct: [__correlated_sq_col_0:Int64]
+                            Projection: customer.c_custkey AS __correlated_sq_col_0 [__correlated_sq_col_0:Int64]
+                              TableScan: customer [c_custkey:Int64, c_name:Utf8]
+                        TableScan: orders [o_orderkey:Int64, o_custkey:Int64, o_orderstatus:Utf8, o_totalprice:Float64;N]
         "
         )
     }
@@ -733,18 +1169,68 @@ mod tests {
             .project(vec![col("customer.c_custkey")])?
             .build()?;
 
-        // Unsupported predicate, subquery should not be decorrelated
+        // Correlated disjunction scalar predicate can be decorrelated through domain keys.
         assert_optimized_plan_equal!(
             plan,
             @r"
         Projection: customer.c_custkey [c_custkey:Int64]
-          Filter: customer.c_custkey = (<subquery>) [c_custkey:Int64, c_name:Utf8]
-            Subquery: [max(orders.o_custkey):Int64;N]
-              Projection: max(orders.o_custkey) [max(orders.o_custkey):Int64;N]
-                Aggregate: groupBy=[[]], aggr=[[max(orders.o_custkey)]] [max(orders.o_custkey):Int64;N]
-                  Filter: outer_ref(customer.c_custkey) = orders.o_custkey OR orders.o_orderkey = Int32(1) [o_orderkey:Int64, o_custkey:Int64, o_orderstatus:Utf8, o_totalprice:Float64;N]
-                    TableScan: orders [o_orderkey:Int64, o_custkey:Int64, o_orderstatus:Utf8, o_totalprice:Float64;N]
-            TableScan: customer [c_custkey:Int64, c_name:Utf8]
+          Projection: customer.c_custkey, customer.c_name [c_custkey:Int64, c_name:Utf8]
+            Filter: customer.c_custkey = __scalar_sq_1.max(orders.o_custkey) [c_custkey:Int64, c_name:Utf8, max(orders.o_custkey):Int64;N, __correlated_sq_col_0:Int64;N]
+              Left Join:  Filter: customer.c_custkey IS NOT DISTINCT FROM __scalar_sq_1.__correlated_sq_col_0 [c_custkey:Int64, c_name:Utf8, max(orders.o_custkey):Int64;N, __correlated_sq_col_0:Int64;N]
+                TableScan: customer [c_custkey:Int64, c_name:Utf8]
+                SubqueryAlias: __scalar_sq_1 [max(orders.o_custkey):Int64;N, __correlated_sq_col_0:Int64]
+                  Projection: max(orders.o_custkey), __correlated_sq_col_0 [max(orders.o_custkey):Int64;N, __correlated_sq_col_0:Int64]
+                    Aggregate: groupBy=[[__scalar_sq_1_domain.__correlated_sq_col_0 AS __correlated_sq_col_0]], aggr=[[max(orders.o_custkey)]] [__correlated_sq_col_0:Int64, max(orders.o_custkey):Int64;N]
+                      Inner Join:  Filter: __scalar_sq_1_domain.__correlated_sq_col_0 = orders.o_custkey OR orders.o_orderkey = Int32(1) [__correlated_sq_col_0:Int64, o_orderkey:Int64, o_custkey:Int64, o_orderstatus:Utf8, o_totalprice:Float64;N]
+                        SubqueryAlias: __scalar_sq_1_domain [__correlated_sq_col_0:Int64]
+                          Distinct: [__correlated_sq_col_0:Int64]
+                            Projection: customer.c_custkey AS __correlated_sq_col_0 [__correlated_sq_col_0:Int64]
+                              TableScan: customer [c_custkey:Int64, c_name:Utf8]
+                        TableScan: orders [o_orderkey:Int64, o_custkey:Int64, o_orderstatus:Utf8, o_totalprice:Float64;N]
+        "
+        )
+    }
+
+    /// Test for correlated scalar subquery not equal with local unary layers
+    #[test]
+    fn scalar_subquery_where_not_eq_with_projection_and_having() -> Result<()> {
+        let sq = Arc::new(
+            LogicalPlanBuilder::from(scan_tpch_table("orders"))
+                .filter(
+                    out_ref_col(DataType::Int64, "customer.c_custkey")
+                        .not_eq(col("orders.o_custkey")),
+                )?
+                .project(vec![col("orders.o_custkey").alias("k")])?
+                .aggregate(Vec::<Expr>::new(), vec![max(col("k"))])?
+                .filter(col("max(k)").gt(lit(1)))?
+                .project(vec![col("max(k)")])?
+                .build()?,
+        );
+
+        let plan = LogicalPlanBuilder::from(scan_tpch_table("customer"))
+            .filter(col("customer.c_custkey").eq(scalar_subquery(sq)))?
+            .project(vec![col("customer.c_custkey")])?
+            .build()?;
+
+        assert_optimized_plan_equal!(
+            plan,
+            @r"
+        Projection: customer.c_custkey [c_custkey:Int64]
+          Projection: customer.c_custkey, customer.c_name [c_custkey:Int64, c_name:Utf8]
+            Filter: customer.c_custkey = __scalar_sq_1.max(k) [c_custkey:Int64, c_name:Utf8, max(k):Int64;N, __correlated_sq_col_0:Int64;N]
+              Left Join:  Filter: customer.c_custkey IS NOT DISTINCT FROM __scalar_sq_1.__correlated_sq_col_0 [c_custkey:Int64, c_name:Utf8, max(k):Int64;N, __correlated_sq_col_0:Int64;N]
+                TableScan: customer [c_custkey:Int64, c_name:Utf8]
+                SubqueryAlias: __scalar_sq_1 [max(k):Int64;N, __correlated_sq_col_0:Int64]
+                  Projection: max(k), __correlated_sq_col_0 [max(k):Int64;N, __correlated_sq_col_0:Int64]
+                    Filter: max(k) > Int32(1) [__correlated_sq_col_0:Int64, max(k):Int64;N]
+                      Aggregate: groupBy=[[__correlated_sq_col_0 AS __correlated_sq_col_0]], aggr=[[max(k)]] [__correlated_sq_col_0:Int64, max(k):Int64;N]
+                        Projection: orders.o_custkey AS k, __scalar_sq_1_domain.__correlated_sq_col_0 AS __correlated_sq_col_0 [k:Int64, __correlated_sq_col_0:Int64]
+                          Inner Join:  Filter: __scalar_sq_1_domain.__correlated_sq_col_0 != orders.o_custkey [__correlated_sq_col_0:Int64, o_orderkey:Int64, o_custkey:Int64, o_orderstatus:Utf8, o_totalprice:Float64;N]
+                            SubqueryAlias: __scalar_sq_1_domain [__correlated_sq_col_0:Int64]
+                              Distinct: [__correlated_sq_col_0:Int64]
+                                Projection: customer.c_custkey AS __correlated_sq_col_0 [__correlated_sq_col_0:Int64]
+                                  TableScan: customer [c_custkey:Int64, c_name:Utf8]
+                            TableScan: orders [o_orderkey:Int64, o_custkey:Int64, o_orderstatus:Utf8, o_totalprice:Float64;N]
         "
         )
     }

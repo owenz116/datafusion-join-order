@@ -509,18 +509,44 @@ SELECT t1_id, (SELECT a FROM (select 1 as a) WHERE a = t1.t1_int) as t2_int from
 44 NULL
 
 #non_equal_correlated_scalar_subquery
-# Currently not supported and should not be decorrelated
+# should be decorrelated through scalar domain keys
 query TT
 explain SELECT t1_id, (SELECT sum(t2_int) FROM t2 WHERE t2.t2_id < t1.t1_id) as t2_sum from t1
 ----
 logical_plan
-01)Projection: t1.t1_id, (<subquery>) AS t2_sum
-02)--Subquery:
-03)----Projection: sum(t2.t2_int)
-04)------Aggregate: groupBy=[[]], aggr=[[sum(CAST(t2.t2_int AS Int64))]]
-05)--------Filter: t2.t2_id < outer_ref(t1.t1_id)
-06)----------TableScan: t2
-07)--TableScan: t1 projection=[t1_id]
+01)Projection: t1.t1_id, __scalar_sq_1.sum(t2.t2_int) AS t2_sum
+02)--Left Join: t1.t1_id = __scalar_sq_1.__correlated_sq_col_0
+03)----TableScan: t1 projection=[t1_id]
+04)----SubqueryAlias: __scalar_sq_1
+05)------Projection: sum(t2.t2_int), __correlated_sq_col_0
+06)--------Aggregate: groupBy=[[__scalar_sq_1_domain.__correlated_sq_col_0 AS __correlated_sq_col_0]], aggr=[[sum(CAST(t2.t2_int AS Int64))]]
+07)----------Projection: __scalar_sq_1_domain.__correlated_sq_col_0, t2.t2_int
+08)------------Inner Join:  Filter: t2.t2_id < __scalar_sq_1_domain.__correlated_sq_col_0
+09)--------------SubqueryAlias: __scalar_sq_1_domain
+10)----------------Aggregate: groupBy=[[__correlated_sq_col_0]], aggr=[[]]
+11)------------------Projection: t1.t1_id AS __correlated_sq_col_0
+12)--------------------TableScan: t1 projection=[t1_id]
+13)--------------TableScan: t2 projection=[t2_id, t2_int]
+
+#non_equal_correlated_scalar_subquery_count
+# should be decorrelated and keep count(*) empty-input semantics
+query TT
+explain SELECT t1_id, (SELECT count(*) FROM t2 WHERE t2.t2_id < t1.t1_id) as t2_cnt from t1
+----
+logical_plan
+01)Projection: t1.t1_id, CASE WHEN __scalar_sq_1.__always_true IS NULL THEN Int64(0) ELSE __scalar_sq_1.count(*) END AS t2_cnt
+02)--Left Join: t1.t1_id = __scalar_sq_1.__correlated_sq_col_0
+03)----TableScan: t1 projection=[t1_id]
+04)----SubqueryAlias: __scalar_sq_1
+05)------Projection: count(Int64(1)) AS count(*), __correlated_sq_col_0, Boolean(true) AS __always_true
+06)--------Aggregate: groupBy=[[__scalar_sq_1_domain.__correlated_sq_col_0 AS __correlated_sq_col_0]], aggr=[[count(Int64(1))]]
+07)----------Projection: __scalar_sq_1_domain.__correlated_sq_col_0
+08)------------Inner Join:  Filter: t2.t2_id < __scalar_sq_1_domain.__correlated_sq_col_0
+09)--------------SubqueryAlias: __scalar_sq_1_domain
+10)----------------Aggregate: groupBy=[[__correlated_sq_col_0]], aggr=[[]]
+11)------------------Projection: t1.t1_id AS __correlated_sq_col_0
+12)--------------------TableScan: t1 projection=[t1_id]
+13)--------------TableScan: t2 projection=[t2_id]
 
 #aggregated_correlated_scalar_subquery_with_extra_group_by_columns
 statement error DataFusion error: Invalid \(non-executable\) plan after Analyzer\ncaused by\nError during planning: A GROUP BY clause in a scalar correlated subquery cannot contain non-correlated columns
